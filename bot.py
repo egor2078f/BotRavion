@@ -13,8 +13,7 @@ try:
         InlineKeyboardMarkup,
         ReplyKeyboardMarkup,
         KeyboardButton,
-        ReplyKeyboardRemove,
-        BufferedInputFile
+        ReplyKeyboardRemove
     )
     from aiogram.filters import Command, CommandStart
     from aiogram.fsm.context import FSMContext
@@ -122,56 +121,50 @@ def parse_content(text: str) -> Dict[str, Any]:
 def format_post(game_name: str, description: str, has_key: bool, code: list) -> str:
     lines = []
     
-    lines.append("╔═══════════════════════╗")
-    lines.append(f"    🎮 {game_name.upper()}")
-    lines.append("╚═══════════════════════╝")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🎮  {game_name.upper()}")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
     lines.append("")
     
     if description:
-        lines.append(f"📋 {description}")
+        lines.append(f"💬  {description}")
         lines.append("")
     
     key_emoji = "🔐" if has_key else "🔓"
-    key_text = "Требуется ключ" if has_key else "Без ключа"
-    lines.append(f"{key_emoji} {key_text}")
+    key_text = "Требуется ключ" if has_key else "Ключ не нужен"
+    lines.append(f"{key_emoji}  {key_text}")
     lines.append("")
     
     if code:
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("⚡ СКРИПТ:")
+        lines.append("⚡  СКРИПТ:")
         lines.append("```lua")
         lines.extend(code)
         lines.append("```")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
         lines.append("")
     
-    lines.append(f"💎 Больше скриптов: {CHANNEL}")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📢  {CHANNEL}")
     
     return '\n'.join(lines)
 
 def get_channel_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Перейти в канал", url='https://t.me/RavionScripts')
+        InlineKeyboardButton(text="📢 Перейти в канал", url='https://t.me/RavionScripts')
     ]])
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="➕ Создать пост")],
-        [KeyboardButton(text="📋 Очередь"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="ℹ️ Помощь")]
+        [KeyboardButton(text="➕ Новый пост")],
+        [KeyboardButton(text="📋 Мои посты"), KeyboardButton(text="📊 Статистика")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_action_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish'),
-            InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')
-        ],
-        [
-            InlineKeyboardButton(text="✏️ Изменить", callback_data='edit'),
-            InlineKeyboardButton(text="❌ Отменить", callback_data='cancel')
-        ]
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish')],
+        [InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data='edit')],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data='cancel')]
     ])
 
 def parse_time(time_str: str) -> datetime | None:
@@ -239,66 +232,72 @@ async def cmd_start(message: Message, state: FSMContext):
     
     username = message.from_user.first_name or "Администратор"
     
-    welcome_text = f"""╔════════════════════════╗
-  👋 Привет, {username}!
-╚════════════════════════╝
+    welcome_text = f"""━━━━━━━━━━━━━━━━━━━
+👋  Привет, {username}!
+━━━━━━━━━━━━━━━━━━━
 
-🤖 Бот для публикации скриптов
+🤖  Я помогу создавать посты для канала
 
-━━━━━━━━━━━━━━━━━━━━━━
-📝 КАК ПОЛЬЗОВАТЬСЯ:
-
-Отправь сообщение в формате:
+📝  Формат сообщения:
 
 Название игры
 Описание (необязательно)
 #key или #nokey
 loadstring(game:HttpGet(...))()
 
-📸 Можно прикрепить фото
-⏰ Можно отложить публикацию
-━━━━━━━━━━━━━━━━━━━━━━
+📸  Можно прикрепить фото
+⏰  Можно отложить публикацию
 
-Нажми ➕ Создать пост"""
+━━━━━━━━━━━━━━━━━━━
+
+Нажми "➕ Новый пост" чтобы начать"""
     
     await message.answer(
         welcome_text,
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
     )
 
-@router.message(F.text == "➕ Создать пост")
+@router.message(F.text == "➕ Новый пост")
 async def new_post(message: Message, state: FSMContext):
     if not check_access(message.from_user.id):
         return
     
-    help_text = """╔════════════════════════╗
-  📝 СОЗДАНИЕ ПОСТА
-╚════════════════════════╝
+    help_text = """━━━━━━━━━━━━━━━━━━━
+📝  СОЗДАНИЕ ПОСТА
+━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━━━
-📌 ПРИМЕР 1 (с ключом):
-━━━━━━━━━━━━━━━━━━━━━━
+Пример 1 (с ключом):
+
 Blox Fruits
 Лучший скрипт для фарма
 #key
-loadstring(game:HttpGet("url"))()
+loadstring(game:HttpGet("ссылка"))()
 
-━━━━━━━━━━━━━━━━━━━━━━
-📌 ПРИМЕР 2 (без ключа):
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━
+
+Пример 2 (без ключа):
+
 Pet Simulator X
 #nokey
-loadstring(game:HttpGet("url"))()
+loadstring(game:HttpGet("ссылка"))()
 
-━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━
 
-💡 Можешь прикрепить фото
-❌ /cancel для отмены"""
+Пример 3 (минимальный):
+
+Arsenal
+loadstring(game:HttpGet("ссылка"))()
+
+━━━━━━━━━━━━━━━━━━━
+
+💡  Можешь прикрепить фото к сообщению
+❌  /cancel для отмены"""
     
     await state.set_state(PostStates.waiting_content)
-    await message.answer(help_text)
+    await message.answer(help_text, parse_mode='Markdown')
 
-@router.message(F.text == "📋 Очередь")
+@router.message(F.text == "📋 Мои посты")
 async def my_posts(message: Message):
     if not check_access(message.from_user.id):
         return
@@ -313,48 +312,17 @@ async def stats(message: Message):
     user_id = message.from_user.id
     count = len([p for p in scheduled_posts.values() if p['user_id'] == user_id])
     
-    stats_text = f"""╔════════════════════════╗
-  📊 СТАТИСТИКА
-╚════════════════════════╝
+    stats_text = f"""━━━━━━━━━━━━━━━━━━━
+📊  СТАТИСТИКА
+━━━━━━━━━━━━━━━━━━━
 
-⏰ В очереди: {count} постов
-📢 Канал: {CHANNEL}
-🤖 Статус: Активен ✅"""
+⏰  Постов в очереди: {count}
+📢  Канал: {CHANNEL}
+🤖  Статус: Активен ✅
+
+━━━━━━━━━━━━━━━━━━━"""
     
-    await message.answer(stats_text)
-
-@router.message(F.text == "ℹ️ Помощь")
-async def help_command(message: Message):
-    if not check_access(message.from_user.id):
-        return
-    
-    help_text = """╔════════════════════════╗
-  ℹ️ СПРАВКА
-╚════════════════════════╝
-
-━━━━━━━━━━━━━━━━━━━━━━
-📝 ФОРМАТ ПОСТА:
-━━━━━━━━━━━━━━━━━━━━━━
-Первая строка - название игры
-Вторая строка - описание
-#key или #nokey
-Далее код скрипта
-
-━━━━━━━━━━━━━━━━━━━━━━
-⏰ ФОРМАТЫ ВРЕМЕНИ:
-━━━━━━━━━━━━━━━━━━━━━━
-14:30 - сегодня в 14:30
-2ч - через 2 часа
-30м - через 30 минут
-1ч30м - через 1.5 часа
-завтра 10:00 - завтра
-
-━━━━━━━━━━━━━━━━━━━━━━
-📸 Фото прикрепляется к
-сообщению с текстом поста
-━━━━━━━━━━━━━━━━━━━━━━"""
-    
-    await message.answer(help_text)
+    await message.answer(stats_text, parse_mode='Markdown')
 
 @router.message(Command("cancel"))
 async def cancel_action(message: Message, state: FSMContext):
@@ -362,7 +330,7 @@ async def cancel_action(message: Message, state: FSMContext):
         return
     
     await state.clear()
-    await message.answer("❌ Действие отменено", reply_markup=get_main_keyboard())
+    await message.answer("❌  Действие отменено", reply_markup=get_main_keyboard())
 
 @router.message(PostStates.waiting_content)
 async def process_content(message: Message, state: FSMContext):
@@ -377,17 +345,20 @@ async def process_content(message: Message, state: FSMContext):
     if message.photo:
         photo_id = message.photo[-1].file_id
         text_content = message.caption or ""
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
+        photo_id = message.document.file_id
+        text_content = message.caption or ""
     else:
         text_content = message.text or ""
     
     if not text_content.strip():
-        await message.answer("⚠️ Пожалуйста, отправьте текст поста")
+        await message.answer("⚠️  Пожалуйста, отправьте текст поста")
         return
     
     parsed = parse_content(text_content)
     
     if not parsed['game']:
-        await message.answer("⚠️ Не удалось определить название игры. Первая строка должна быть названием.")
+        await message.answer("⚠️  Не удалось определить название игры\nПервая строка должна быть названием")
         return
     
     user_data[user_id] = {
@@ -410,12 +381,14 @@ async def process_schedule_time(message: Message, state: FSMContext):
     stime = parse_time(message.text)
     if not stime:
         await message.answer(
-            "⚠️ Неверный формат времени\n\n"
+            "⚠️  Неверный формат времени\n\n"
             "Примеры:\n"
-            "• 14:30 - сегодня\n"
+            "• 14:30 - сегодня в 14:30\n"
             "• 2ч - через 2 часа\n"
             "• 30м - через 30 минут\n"
-            "• завтра 10:00"
+            "• 1ч30м - через 1.5 часа\n"
+            "• завтра 10:00 - завтра в 10:00",
+            parse_mode='Markdown'
         )
         return
     
@@ -434,10 +407,14 @@ async def process_schedule_time(message: Message, state: FSMContext):
     asyncio.create_task(schedule_bg_task(message.bot, pid))
     
     await message.answer(
-        f"✅ Пост запланирован!\n\n"
-        f"🎮 {d['game']}\n"
-        f"⏰ {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"Посмотреть: 📋 Очередь",
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"✅  ПОСТ ЗАПЛАНИРОВАН\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎮  {d['game']}\n"
+        f"⏰  {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Посмотреть очередь: 📋 Мои посты",
+        parse_mode='Markdown',
         reply_markup=get_main_keyboard()
     )
     
@@ -462,14 +439,16 @@ async def callback_schedule(callback: CallbackQuery, state: FSMContext):
     
     await state.set_state(PostStates.waiting_time)
     await callback.message.answer(
-        "╔════════════════════════╗\n"
-        "  ⏰ ВРЕМЯ ПУБЛИКАЦИИ\n"
-        "╚════════════════════════╝\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "⏰  КОГДА ОПУБЛИКОВАТЬ?\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
         "Примеры:\n"
-        "• 14:30\n"
-        "• 2ч\n"
-        "• 30м\n"
-        "• завтра 10:00"
+        "• 14:30 - сегодня в 14:30\n"
+        "• 2ч - через 2 часа\n"
+        "• 30м - через 30 минут\n"
+        "• 1ч30м - через 1 час 30 мин\n"
+        "• завтра 10:00 - завтра в 10:00",
+        parse_mode='Markdown'
     )
     await callback.answer()
 
@@ -481,7 +460,12 @@ async def callback_edit(callback: CallbackQuery, state: FSMContext):
     
     await state.set_state(PostStates.waiting_content)
     await callback.message.answer(
-        "✏️ Отправьте новый контент в том же формате"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "✏️  РЕДАКТИРОВАНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "Отправь новый контент в том же формате\n"
+        "Все данные будут обновлены",
+        parse_mode='Markdown'
     )
     await callback.answer()
 
@@ -495,7 +479,7 @@ async def callback_cancel(callback: CallbackQuery, state: FSMContext):
     user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
     
     await state.clear()
-    await callback.message.answer("❌ Пост отменён", reply_markup=get_main_keyboard())
+    await callback.message.answer("❌  Пост отменён", reply_markup=get_main_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data.startswith('del_'))
@@ -516,28 +500,31 @@ async def show_preview(message: Message, user_id: int):
     d = user_data[user_id]
     text = format_post(d['game'], d['desc'], d['key'], d['code'])
     
-    preview_header = "╔════════════════════════╗\n  👀 ПРЕДПРОСМОТР\n╚════════════════════════╝\n\n"
+    preview_header = "━━━━━━━━━━━━━━━━━━━\n👀  ПРЕДПРОСМОТР\n━━━━━━━━━━━━━━━━━━━\n\n"
     
     try:
         if d.get('photo'):
             await message.answer_photo(
                 photo=d['photo'], 
                 caption=preview_header + text, 
+                parse_mode='Markdown', 
                 reply_markup=get_action_keyboard()
             )
         else:
             await message.answer(
                 preview_header + text, 
+                parse_mode='Markdown', 
                 reply_markup=get_action_keyboard()
             )
     except Exception as e:
         logger.error(f"Ошибка предпросмотра: {e}")
         await message.answer(
-            "⚠️ Ошибка отображения\n\n"
+            "⚠️  Ошибка отображения\n\n"
             "Возможные причины:\n"
-            "• Слишком длинный текст\n"
-            "• Неверный формат\n"
-            "• Проблема с фото"
+            "• Текст слишком длинный\n"
+            "• Неверный формат Markdown\n"
+            "• Проблема с фото\n\n"
+            "Попробуйте заново создать пост"
         )
 
 async def publish_now(message: Message, user_id: int, bot: Bot):
@@ -551,21 +538,25 @@ async def publish_now(message: Message, user_id: int, bot: Bot):
                 chat_id=CHANNEL, 
                 photo=d['photo'], 
                 caption=text, 
+                parse_mode='Markdown', 
                 reply_markup=markup
             )
         else:
             await bot.send_message(
                 chat_id=CHANNEL, 
                 text=text, 
+                parse_mode='Markdown', 
                 reply_markup=markup
             )
         
         await message.answer(
-            f"╔════════════════════════╗\n"
-            f"  ✅ УСПЕШНО\n"
-            f"╚════════════════════════╝\n\n"
-            f"🎮 {d['game']}\n"
-            f"📢 {CHANNEL}",
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"✅  УСПЕШНО ОПУБЛИКОВАНО\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎮  {d['game']}\n"
+            f"📢  {CHANNEL}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━",
+            parse_mode='Markdown',
             reply_markup=get_main_keyboard()
         )
         
@@ -573,10 +564,15 @@ async def publish_now(message: Message, user_id: int, bot: Bot):
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
         await message.answer(
-            f"❌ Ошибка публикации\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"❌  ОШИБКА ПУБЛИКАЦИИ\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{str(e)[:200]}\n\n"
             f"Проверьте:\n"
             f"• Бот админ в {CHANNEL}\n"
-            f"• Права на публикацию"
+            f"• Есть права на публикацию\n"
+            f"• Канал существует",
+            parse_mode='Markdown'
         )
 
 async def schedule_bg_task(bot: Bot, pid: str):
@@ -590,24 +586,28 @@ async def schedule_bg_task(bot: Bot, pid: str):
                         chat_id=CHANNEL, 
                         photo=post['photo'], 
                         caption=post['text'], 
+                        parse_mode='Markdown', 
                         reply_markup=markup
                     )
                 else:
                     await bot.send_message(
                         chat_id=CHANNEL, 
                         text=post['text'], 
+                        parse_mode='Markdown', 
                         reply_markup=markup
                     )
                 
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"✅ Пост опубликован!\n\n🎮 {post['game']}\n📢 {CHANNEL}"
+                    text=f"━━━━━━━━━━━━━━━━━━━\n✅  ПОСТ ОПУБЛИКОВАН\n━━━━━━━━━━━━━━━━━━━\n\n🎮  {post['game']}\n📢  {CHANNEL}", 
+                    parse_mode='Markdown'
                 )
             except Exception as e:
                 logger.error(f"Ошибка отложенной публикации: {e}")
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"❌ Ошибка публикации"
+                    text=f"❌  Ошибка публикации:\n{str(e)[:200]}",
+                    parse_mode='Markdown'
                 )
             
             if pid in scheduled_posts:
@@ -620,14 +620,15 @@ async def show_scheduled(message: Message, user_id: int):
     
     if not posts:
         await message.answer(
-            "╔════════════════════════╗\n"
-            "  📭 ОЧЕРЕДЬ ПУСТА\n"
-            "╚════════════════════════╝\n\n"
-            "Создайте новый пост!"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "📭  НЕТ ЗАПЛАНИРОВАННЫХ ПОСТОВ\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n"
+            "Создайте новый пост и отложите его",
+            parse_mode='Markdown'
         )
         return
 
-    text = "╔════════════════════════╗\n  📅 ОЧЕРЕДЬ ПОСТОВ\n╚════════════════════════╝\n\n"
+    text = "━━━━━━━━━━━━━━━━━━━\n📅  ЗАПЛАНИРОВАННЫЕ ПОСТЫ\n━━━━━━━━━━━━━━━━━━━\n\n"
     kb = []
     
     for pid, p in sorted(posts.items(), key=lambda x: x[1]['time']):
@@ -643,15 +644,18 @@ async def show_scheduled(message: Message, user_id: int):
         else:
             countdown = f"через {minutes_left}м"
         
-        text += f"🎮 {game_title}\n⏰ {time_str} ({countdown})\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        text += f"🎮  {game_title}\n⏰  {time_str} ({countdown})\n\n"
         kb.append([InlineKeyboardButton(
             text=f"❌ {game_title}", 
             callback_data=f'del_{pid}'
         )])
     
+    text += "━━━━━━━━━━━━━━━━━━━"
+    
     await message.answer(
         text, 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), 
+        parse_mode='Markdown'
     )
 
 async def main():
