@@ -11,7 +11,9 @@ try:
         CallbackQuery, 
         InlineKeyboardButton, 
         InlineKeyboardMarkup,
-        PhotoSize
+        ReplyKeyboardMarkup,
+        KeyboardButton,
+        ReplyKeyboardRemove
     )
     from aiogram.filters import Command, CommandStart
     from aiogram.fsm.context import FSMContext
@@ -43,15 +45,8 @@ scheduled_posts: Dict[str, Dict[str, Any]] = {}
 
 # --- FSM STATES ---
 class PostStates(StatesGroup):
-    game = State()
-    desc = State()
-    key = State()
-    code = State()
-    schedule = State()
-    edit_game = State()
-    edit_desc = State()
-    edit_code = State()
-    edit_photo = State()
+    waiting_content = State()  # Ждём весь контент сразу
+    waiting_time = State()     # Ждём время для отложки
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def process_script_logic(text: str) -> list:
@@ -84,6 +79,65 @@ def process_script_logic(text: str) -> list:
             
     return code_lines
 
+def parse_content(text: str) -> Dict[str, Any]:
+    """
+    Умный парсинг контента.
+    Формат: 
+    Название игры
+    Описание (опционально)
+    #key или #nokey
+    Скрипт
+    """
+    lines = text.strip().split('\n')
+    
+    result = {
+        'game': '',
+        'desc': '',
+        'key': False,
+        'code': []
+    }
+    
+    if not lines:
+        return result
+    
+    # Первая строка - всегда название игры
+    result['game'] = lines[0].strip()
+    
+    # Ищем маркер ключа и код
+    code_start_idx = None
+    
+    for i, line in enumerate(lines[1:], start=1):
+        lower_line = line.lower().strip()
+        
+        # Проверка маркеров ключа
+        if '#key' in lower_line or 'key+' in lower_line or '+key' in lower_line:
+            result['key'] = True
+            continue
+        elif '#nokey' in lower_line or 'key-' in lower_line or '-key' in lower_line or 'no key' in lower_line:
+            result['key'] = False
+            continue
+        
+        # Определяем начало кода
+        if code_start_idx is None and any(k in lower_line for k in ['loadstring', 'game:', 'local ', 'function', '```']):
+            code_start_idx = i
+            break
+    
+    # Если есть описание (между названием и кодом)
+    if code_start_idx and code_start_idx > 1:
+        desc_lines = []
+        for i in range(1, code_start_idx):
+            line = lines[i].strip()
+            if line and not line.startswith('#') and 'key' not in line.lower():
+                desc_lines.append(line)
+        result['desc'] = ' '.join(desc_lines)
+    
+    # Обрабатываем код
+    if code_start_idx:
+        code_text = '\n'.join(lines[code_start_idx:])
+        result['code'] = process_script_logic(code_text)
+    
+    return result
+
 def format_post(game_name: str, description: str, has_key: bool, code: list) -> str:
     """Формирование текста поста"""
     lines = []
@@ -92,29 +146,46 @@ def format_post(game_name: str, description: str, has_key: bool, code: list) -> 
     lines.append("")
     
     if description:
-        lines.append(f"{description}")
+        lines.append(f"📝 {description}")
         lines.append("")
     
-    key_status = "🔐 **Key:** Required" if has_key else "🔓 **Key:** Not Required"
+    key_status = "🔐 **Ключ:** Требуется" if has_key else "🔓 **Ключ:** Не требуется"
     lines.append(key_status)
     lines.append("")
     
     if code:
-        lines.append("⚡ **Script:**")
+        lines.append("⚡ **Скрипт:**")
         lines.append("```lua")
         lines.extend(code)
         lines.append("```")
+        lines.append("")
     
-    lines.append("")
-    lines.append(f"💎 **Source:** {CHANNEL}")
+    lines.append(f"💎 **Канал:** {CHANNEL}")
     
     return '\n'.join(lines)
 
 def get_channel_button() -> InlineKeyboardMarkup:
     """Кнопка канала"""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Open Channel", url='https://t.me/RavionScripts')
+        InlineKeyboardButton(text="🚀 Подписаться", url='https://t.me/RavionScripts')
     ]])
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Главная клавиатура"""
+    keyboard = [
+        [KeyboardButton(text="➕ Новый пост")],
+        [KeyboardButton(text="📋 Мои посты"), KeyboardButton(text="📊 Статистика")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def get_action_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура действий с постом"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish')],
+        [InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data='edit')],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data='cancel')]
+    ])
 
 def parse_time(time_str: str) -> datetime | None:
     """Парсинг времени для отложенной публикации"""
@@ -122,12 +193,28 @@ def parse_time(time_str: str) -> datetime | None:
         now = datetime.now()
         time_str = time_str.lower().strip()
         
-        # Формат 14:30
+        # Формат: 14:30
         time_match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
         if time_match:
             hour, minute = int(time_match.group(1)), int(time_match.group(2))
             target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return target + timedelta(days=1) if target <= now else target
+        
+        # Формат: 1ч, 2ч, 30м, 1ч30м
+        if 'ч' in time_str or 'м' in time_str:
+            hours = 0
+            minutes = 0
+            
+            hours_match = re.search(r'(\d+)ч', time_str)
+            if hours_match:
+                hours = int(hours_match.group(1))
+            
+            mins_match = re.search(r'(\d+)м', time_str)
+            if mins_match:
+                minutes = int(mins_match.group(1))
+            
+            if hours or minutes:
+                return now + timedelta(hours=hours, minutes=minutes)
         
         # Формат: завтра 14:30
         if 'завтра' in time_str:
@@ -139,16 +226,6 @@ def parse_time(time_str: str) -> datetime | None:
                     second=0, 
                     microsecond=0
                 )
-                
-        # Формат: через 1 час
-        hours_match = re.search(r'через\s+(\d+)\s+ч', time_str)
-        if hours_match:
-            return now + timedelta(hours=int(hours_match.group(1)))
-            
-        # Формат: через 10 мин
-        mins_match = re.search(r'через\s+(\d+)\s+мин', time_str)
-        if mins_match:
-            return now + timedelta(minutes=int(mins_match.group(1)))
     except Exception as e:
         logger.error(f"Ошибка парсинга времени: {e}")
         return None
@@ -182,216 +259,166 @@ async def cmd_start(message: Message, state: FSMContext):
     
     await state.clear()
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Создать пост", callback_data='create')],
-        [InlineKeyboardButton(text="⏰ Отложенные", callback_data='scheduled')],
-        [InlineKeyboardButton(text="📊 Статус", callback_data='stats')]
-    ])
+    username = message.from_user.first_name or "Администратор"
+    
+    welcome_text = f"""👋 **Привет, {username}!**
+
+🤖 Я помогу тебе быстро создавать посты для канала.
+
+**Как использовать:**
+📝 Просто отправь мне текст в формате:
+
+```
+Название игры
+Описание (необязательно)
+#key или #nokey
+loadstring(game:HttpGet(...))()
+```
+
+📸 Можно прикрепить фото
+⏰ Можно отложить публикацию
+
+Нажми **➕ Новый пост** чтобы начать!"""
     
     await message.answer(
-        f"👋 **Ravion Admin Panel**\nID: `{user_id}`\nБот активен и готов к работе.",
-        reply_markup=keyboard,
+        welcome_text,
+        reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
     )
 
-@router.callback_query(F.data == 'create')
-async def callback_create(callback: CallbackQuery, state: FSMContext):
-    """Создание нового поста"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+@router.message(F.text == "➕ Новый пост")
+async def new_post(message: Message, state: FSMContext):
+    """Начало создания поста"""
+    if not check_access(message.from_user.id):
         return
     
-    await state.set_state(PostStates.game)
-    await callback.message.answer("🎮 Введите **название игры**:", parse_mode='Markdown')
-    await callback.answer()
+    help_text = """📝 **Создание поста**
 
-@router.callback_query(F.data == 'stats')
-async def callback_stats(callback: CallbackQuery):
-    """Статистика"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    user_id = callback.from_user.id
-    count = len([p for p in scheduled_posts.values() if p['user_id'] == user_id])
-    await callback.message.answer(
-        f"📊 В очереди: **{count}**\nКанал: {CHANNEL}", 
-        parse_mode='Markdown'
-    )
-    await callback.answer()
+Отправь мне контент в таком формате:
 
-@router.callback_query(F.data == 'preview')
-async def callback_preview(callback: CallbackQuery):
-    """Предпросмотр поста"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    await show_preview(callback.message, callback.from_user.id)
-    await callback.answer()
+**Пример 1 (с ключом):**
+```
+Blox Fruits
+Лучший скрипт для фарма
+#key
+loadstring(game:HttpGet("ссылка"))()
+```
 
-@router.callback_query(F.data == 'publish')
-async def callback_publish(callback: CallbackQuery):
-    """Публикация поста"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    await publish_now(callback.message, callback.from_user.id, callback.bot)
-    await callback.answer()
+**Пример 2 (без ключа):**
+```
+Pet Simulator X
+#nokey
+loadstring(game:HttpGet("ссылка"))()
+```
 
-@router.callback_query(F.data == 'schedule')
-async def callback_schedule(callback: CallbackQuery, state: FSMContext):
-    """Запланировать пост"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    await state.set_state(PostStates.schedule)
-    await callback.message.answer(
-        "⏰ Введите время (например: `14:30`, `завтра 10:00` или `через 1 час`):", 
-        parse_mode='Markdown'
-    )
-    await callback.answer()
+**Пример 3 (минимальный):**
+```
+Arsenal
+loadstring(game:HttpGet("ссылка"))()
+```
 
-@router.callback_query(F.data == 'edit')
-async def callback_edit(callback: CallbackQuery):
-    """Редактирование поста"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Название", callback_data='edit_game'), 
-            InlineKeyboardButton(text="Описание", callback_data='edit_desc')
-        ],
-        [
-            InlineKeyboardButton(text="Код", callback_data='edit_code'), 
-            InlineKeyboardButton(text="Фото", callback_data='edit_photo')
-        ],
-        [InlineKeyboardButton(text="Ключ вкл/выкл", callback_data='toggle_key')],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data='preview')]
-    ])
-    await callback.message.answer("✏️ Что редактируем?", reply_markup=kb)
-    await callback.answer()
+💡 Можешь сразу прикрепить фото к сообщению!
 
-@router.callback_query(F.data == 'toggle_key')
-async def callback_toggle_key(callback: CallbackQuery):
-    """Переключение ключа"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
+Или отправь `/cancel` для отмены."""
     
-    user_id = callback.from_user.id
-    user_data[user_id]['key'] = not user_data[user_id]['key']
-    await show_preview(callback.message, user_id)
-    await callback.answer()
+    await state.set_state(PostStates.waiting_content)
+    await message.answer(help_text, parse_mode='Markdown')
 
-@router.callback_query(F.data.startswith('edit_'))
-async def callback_edit_field(callback: CallbackQuery, state: FSMContext):
-    """Редактирование поля"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    field = callback.data.replace('edit_', '')
-    state_map = {
-        'game': PostStates.edit_game,
-        'desc': PostStates.edit_desc,
-        'code': PostStates.edit_code,
-        'photo': PostStates.edit_photo
-    }
-    
-    await state.set_state(state_map[field])
-    await callback.message.answer(f"✏️ Введите новое значение для **{field}**:", parse_mode='Markdown')
-    await callback.answer()
-
-@router.callback_query(F.data == 'scheduled')
-async def callback_scheduled(callback: CallbackQuery):
+@router.message(F.text == "📋 Мои посты")
+async def my_posts(message: Message):
     """Показать отложенные посты"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    await show_scheduled(callback.message, callback.from_user.id)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith('del_sch_'))
-async def callback_delete_scheduled(callback: CallbackQuery):
-    """Удалить отложенный пост"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    pid = callback.data.replace('del_sch_', '')
-    if pid in scheduled_posts:
-        del scheduled_posts[pid]
-        await callback.message.answer("✅ Отменено")
-        await show_scheduled(callback.message, callback.from_user.id)
-    await callback.answer()
-
-@router.callback_query(F.data.in_(['key_yes', 'key_no']))
-async def callback_key(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора ключа"""
-    if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    user_id = callback.from_user.id
-    user_data[user_id]['key'] = (callback.data == 'key_yes')
-    
-    await state.set_state(PostStates.code)
-    await callback.message.answer("⚡ Вставьте **скрипт** (авто-обработка включена):", parse_mode='Markdown')
-    await callback.answer()
-
-# --- ОБРАБОТЧИКИ СОСТОЯНИЙ ---
-@router.message(PostStates.game)
-async def process_game(message: Message, state: FSMContext):
-    """Обработка названия игры"""
     if not check_access(message.from_user.id):
         return
     
-    user_data[message.from_user.id]['game'] = message.text.strip()
-    await state.set_state(PostStates.desc)
-    await message.answer("📝 Теперь введите **описание**:", parse_mode='Markdown')
+    await show_scheduled(message, message.from_user.id)
 
-@router.message(PostStates.desc)
-async def process_desc(message: Message, state: FSMContext):
-    """Обработка описания"""
+@router.message(F.text == "📊 Статистика")
+async def stats(message: Message):
+    """Статистика"""
     if not check_access(message.from_user.id):
         return
     
-    user_data[message.from_user.id]['desc'] = message.text.strip()
+    user_id = message.from_user.id
+    count = len([p for p in scheduled_posts.values() if p['user_id'] == user_id])
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔐 Да", callback_data='key_yes'), 
-        InlineKeyboardButton(text="🔓 Нет", callback_data='key_no')
-    ]])
-    await message.answer("🔑 Нужен ключ?", reply_markup=kb)
+    stats_text = f"""📊 **Статистика**
 
-@router.message(PostStates.code)
-async def process_code(message: Message, state: FSMContext):
-    """Обработка кода"""
+⏰ Постов в очереди: **{count}**
+📢 Канал: {CHANNEL}
+🤖 Статус бота: **Активен** ✅"""
+    
+    await message.answer(stats_text, parse_mode='Markdown')
+
+@router.message(Command("cancel"))
+async def cancel_action(message: Message, state: FSMContext):
+    """Отмена действия"""
     if not check_access(message.from_user.id):
         return
-    
-    processed_code = process_script_logic(message.text)
-    user_data[message.from_user.id]['code'] = processed_code
     
     await state.clear()
-    await message.answer("✅ Скрипт обработан и улучшен.")
-    await show_preview(message, message.from_user.id)
+    await message.answer("❌ Действие отменено", reply_markup=get_main_keyboard())
 
-@router.message(PostStates.schedule)
-async def process_schedule(message: Message, state: FSMContext):
+@router.message(PostStates.waiting_content)
+async def process_content(message: Message, state: FSMContext):
+    """Обработка контента поста"""
+    if not check_access(message.from_user.id):
+        return
+    
+    user_id = message.from_user.id
+    
+    # Проверка на фото
+    photo_id = None
+    text_content = ""
+    
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+        text_content = message.caption or ""
+    else:
+        text_content = message.text or ""
+    
+    if not text_content.strip():
+        await message.answer("⚠️ Пожалуйста, отправьте текст поста")
+        return
+    
+    # Парсим контент
+    parsed = parse_content(text_content)
+    
+    if not parsed['game']:
+        await message.answer("⚠️ Не удалось определить название игры. Первая строка должна быть названием.")
+        return
+    
+    # Сохраняем данные
+    user_data[user_id] = {
+        'game': parsed['game'],
+        'desc': parsed['desc'],
+        'key': parsed['key'],
+        'code': parsed['code'],
+        'photo': photo_id
+    }
+    
+    await state.clear()
+    
+    # Показываем превью
+    await show_preview(message, user_id)
+
+@router.message(PostStates.waiting_time)
+async def process_schedule_time(message: Message, state: FSMContext):
     """Обработка времени отложки"""
     if not check_access(message.from_user.id):
         return
     
     stime = parse_time(message.text)
     if not stime:
-        await message.answer("❌ Неверный формат времени.\nПопробуйте: `15:00` или `через 2 часа`", parse_mode='Markdown')
+        await message.answer(
+            "⚠️ Неверный формат.\n\n"
+            "**Примеры:**\n"
+            "`14:30` - сегодня в 14:30\n"
+            "`2ч` - через 2 часа\n"
+            "`30м` - через 30 минут\n"
+            "`1ч30м` - через 1.5 часа\n"
+            "`завтра 10:00` - завтра в 10:00",
+            parse_mode='Markdown'
+        )
         return
     
     user_id = message.from_user.id
@@ -409,102 +436,126 @@ async def process_schedule(message: Message, state: FSMContext):
     # Запускаем фоновую задачу
     asyncio.create_task(schedule_bg_task(message.bot, pid))
     
-    await message.answer(f"✅ Запланировано на **{stime.strftime('%d.%m %H:%M')}**", parse_mode='Markdown')
-    await state.clear()
+    await message.answer(
+        f"✅ **Пост запланирован!**\n\n"
+        f"🎮 {d['game']}\n"
+        f"⏰ {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Посмотреть очередь: 📋 Мои посты",
+        parse_mode='Markdown',
+        reply_markup=get_main_keyboard()
+    )
     
-    # Сброс данных
+    await state.clear()
     user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
 
-@router.message(PostStates.edit_game)
-async def process_edit_game(message: Message, state: FSMContext):
-    """Редактирование названия"""
-    if not check_access(message.from_user.id):
+# --- CALLBACK HANDLERS ---
+@router.callback_query(F.data == 'publish')
+async def callback_publish(callback: CallbackQuery, state: FSMContext):
+    """Публикация поста"""
+    if not check_access(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
-    user_data[message.from_user.id]['game'] = message.text.strip()
+    await publish_now(callback.message, callback.from_user.id, callback.bot)
     await state.clear()
-    await show_preview(message, message.from_user.id)
+    await callback.answer()
 
-@router.message(PostStates.edit_desc)
-async def process_edit_desc(message: Message, state: FSMContext):
-    """Редактирование описания"""
-    if not check_access(message.from_user.id):
+@router.callback_query(F.data == 'schedule')
+async def callback_schedule(callback: CallbackQuery, state: FSMContext):
+    """Запланировать пост"""
+    if not check_access(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
-    user_data[message.from_user.id]['desc'] = message.text.strip()
+    await state.set_state(PostStates.waiting_time)
+    await callback.message.answer(
+        "⏰ **Когда опубликовать?**\n\n"
+        "**Примеры:**\n"
+        "`14:30` - сегодня в 14:30\n"
+        "`2ч` - через 2 часа\n"
+        "`30м` - через 30 минут\n"
+        "`1ч30м` - через 1 час 30 мин\n"
+        "`завтра 10:00` - завтра в 10:00",
+        parse_mode='Markdown'
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == 'edit')
+async def callback_edit(callback: CallbackQuery, state: FSMContext):
+    """Редактирование поста"""
+    if not check_access(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    await state.set_state(PostStates.waiting_content)
+    await callback.message.answer(
+        "✏️ **Редактирование**\n\n"
+        "Отправь новый контент в том же формате.\n"
+        "Все данные будут обновлены.",
+        parse_mode='Markdown'
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == 'cancel')
+async def callback_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена создания поста"""
+    if not check_access(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
+    
     await state.clear()
-    await show_preview(message, message.from_user.id)
+    await callback.message.answer("❌ Пост отменён", reply_markup=get_main_keyboard())
+    await callback.answer()
 
-@router.message(PostStates.edit_code)
-async def process_edit_code(message: Message, state: FSMContext):
-    """Редактирование кода"""
-    if not check_access(message.from_user.id):
+@router.callback_query(F.data.startswith('del_'))
+async def callback_delete_scheduled(callback: CallbackQuery):
+    """Удалить отложенный пост"""
+    if not check_access(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
-    processed_code = process_script_logic(message.text)
-    user_data[message.from_user.id]['code'] = processed_code
-    await state.clear()
-    await show_preview(message, message.from_user.id)
+    pid = callback.data.replace('del_', '')
+    if pid in scheduled_posts:
+        game_name = scheduled_posts[pid].get('game', 'Пост')
+        del scheduled_posts[pid]
+        await callback.answer(f"✅ {game_name} удалён", show_alert=True)
+        await show_scheduled(callback.message, callback.from_user.id)
+    await callback.answer()
 
-@router.message(PostStates.edit_photo, F.photo)
-async def process_edit_photo(message: Message, state: FSMContext):
-    """Редактирование фото"""
-    if not check_access(message.from_user.id):
-        return
-    
-    user_data[message.from_user.id]['photo'] = message.photo[-1].file_id
-    await state.clear()
-    await message.answer("🖼 Фото обновлено")
-    await show_preview(message, message.from_user.id)
-
-@router.message(PostStates.edit_photo, F.text)
-async def process_delete_photo(message: Message, state: FSMContext):
-    """Удаление фото"""
-    if not check_access(message.from_user.id):
-        return
-    
-    if message.text.lower().strip() == 'удалить':
-        user_data[message.from_user.id]['photo'] = None
-        await state.clear()
-        await message.answer("🖼 Фото удалено")
-        await show_preview(message, message.from_user.id)
-
-@router.message(F.photo)
-async def handle_photo(message: Message):
-    """Обработка фото вне состояний"""
-    if not check_access(message.from_user.id):
-        return
-    
-    user_id = message.from_user.id
-    if user_id in user_data:
-        user_data[user_id]['photo'] = message.photo[-1].file_id
-        await message.answer("🖼 Фото сохранено")
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ASYNC ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def show_preview(message: Message, user_id: int):
     """Показать предпросмотр поста"""
     d = user_data[user_id]
     text = format_post(d['game'], d['desc'], d['key'], d['code'])
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish')],
-        [InlineKeyboardButton(text="⏰ Запланировать", callback_data='schedule')],
-        [InlineKeyboardButton(text="✏️ Изменить", callback_data='edit')]
-    ])
+    preview_header = "👀 **ПРЕДПРОСМОТР**\n\n"
     
     try:
         if d.get('photo'):
             await message.answer_photo(
                 photo=d['photo'], 
-                caption=text, 
+                caption=preview_header + text, 
                 parse_mode='Markdown', 
-                reply_markup=kb
+                reply_markup=get_action_keyboard()
             )
         else:
-            await message.answer(text, parse_mode='Markdown', reply_markup=kb)
+            await message.answer(
+                preview_header + text, 
+                parse_mode='Markdown', 
+                reply_markup=get_action_keyboard()
+            )
     except Exception as e:
         logger.error(f"Ошибка предпросмотра: {e}")
-        await message.answer("⚠️ Ошибка предпросмотра. Возможно, текст слишком длинный или неверный формат.")
+        await message.answer(
+            "⚠️ Ошибка отображения. Возможно:\n"
+            "• Текст слишком длинный\n"
+            "• Неверный формат Markdown\n"
+            "• Проблема с фото\n\n"
+            "Попробуйте заново создать пост."
+        )
 
 async def publish_now(message: Message, user_id: int, bot: Bot):
     """Опубликовать пост сейчас"""
@@ -529,11 +580,26 @@ async def publish_now(message: Message, user_id: int, bot: Bot):
                 reply_markup=markup
             )
         
-        await message.answer("✅ Опубликовано!")
+        await message.answer(
+            f"✅ **Успешно опубликовано!**\n\n"
+            f"🎮 {d['game']}\n"
+            f"📢 {CHANNEL}",
+            parse_mode='Markdown',
+            reply_markup=get_main_keyboard()
+        )
+        
         user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
-        await message.answer(f"❌ Ошибка при отправке в канал: {e}\nУбедитесь, что бот является администратором в {CHANNEL}")
+        await message.answer(
+            f"❌ **Ошибка публикации**\n\n"
+            f"`{str(e)[:200]}`\n\n"
+            f"**Проверьте:**\n"
+            f"• Бот админ в {CHANNEL}\n"
+            f"• Есть права на публикацию\n"
+            f"• Канал существует",
+            parse_mode='Markdown'
+        )
 
 async def schedule_bg_task(bot: Bot, pid: str):
     """Фоновая задача для отложенной публикации"""
@@ -557,16 +623,18 @@ async def schedule_bg_task(bot: Bot, pid: str):
                         parse_mode='Markdown', 
                         reply_markup=markup
                     )
+                
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"✅ Пост **{post['game']}** опубликован!", 
+                    text=f"✅ **Пост опубликован!**\n\n🎮 {post['game']}\n📢 {CHANNEL}", 
                     parse_mode='Markdown'
                 )
             except Exception as e:
                 logger.error(f"Ошибка отложенной публикации: {e}")
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"❌ Ошибка отложки: {e}"
+                    text=f"❌ Ошибка публикации:\n`{str(e)[:200]}`",
+                    parse_mode='Markdown'
                 )
             
             if pid in scheduled_posts:
@@ -577,20 +645,35 @@ async def schedule_bg_task(bot: Bot, pid: str):
 async def show_scheduled(message: Message, user_id: int):
     """Показать отложенные посты"""
     posts = {k: v for k, v in scheduled_posts.items() if v['user_id'] == user_id}
+    
     if not posts:
-        await message.answer("📭 Нет запланированных постов")
+        await message.answer(
+            "📭 **Нет запланированных постов**\n\n"
+            "Создайте новый пост и отложите его!",
+            parse_mode='Markdown'
+        )
         return
 
-    text = "📅 **Очередь публикации:**\n\n"
+    text = "📅 **Запланированные посты:**\n\n"
     kb = []
     
     for pid, p in sorted(posts.items(), key=lambda x: x[1]['time']):
-        t_str = p['time'].strftime('%d.%m %H:%M')
+        time_left = p['time'] - datetime.now()
+        hours_left = int(time_left.total_seconds() / 3600)
+        minutes_left = int((time_left.total_seconds() % 3600) / 60)
+        
+        time_str = p['time'].strftime('%d.%m в %H:%M')
         game_title = p.get('game', 'Без названия')
-        text += f"🔹 {t_str} - {game_title}\n"
+        
+        if hours_left > 0:
+            countdown = f"через {hours_left}ч {minutes_left}м"
+        else:
+            countdown = f"через {minutes_left}м"
+        
+        text += f"🎮 **{game_title}**\n⏰ {time_str} ({countdown})\n\n"
         kb.append([InlineKeyboardButton(
-            text=f"❌ Удалить {game_title}", 
-            callback_data=f'del_sch_{pid}'
+            text=f"❌ {game_title}", 
+            callback_data=f'del_{pid}'
         )])
     
     await message.answer(
@@ -602,17 +685,15 @@ async def show_scheduled(message: Message, user_id: int):
 # --- ГЛАВНАЯ ФУНКЦИЯ ---
 async def main():
     """Точка входа"""
-    logger.info("Запуск бота...")
+    logger.info("🚀 Запуск бота...")
     
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     
-    # Регистрация роутера
     dp.include_router(router)
     
-    logger.info(f"Бот успешно запущен! Канал: {CHANNEL}")
+    logger.info(f"✅ Бот запущен! Канал: {CHANNEL}")
     
-    # Удаляем webhook и запускаем polling
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=['message', 'callback_query'])
 
@@ -620,6 +701,6 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+        logger.info("⛔ Бот остановлен")
     except Exception as e:
-        logger.error(f"CRITICAL ERROR: {e}")
+        logger.error(f"💥 CRITICAL ERROR: {e}")
