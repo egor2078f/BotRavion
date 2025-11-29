@@ -1,6 +1,8 @@
 import logging
 import re
 import asyncio
+import io
+import random
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
@@ -13,15 +15,16 @@ try:
         InlineKeyboardMarkup,
         ReplyKeyboardMarkup,
         KeyboardButton,
-        ReplyKeyboardRemove
+        BufferedInputFile
     )
     from aiogram.filters import Command, CommandStart
     from aiogram.fsm.context import FSMContext
     from aiogram.fsm.state import State, StatesGroup
     from aiogram.fsm.storage.memory import MemoryStorage
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
-    print("CRITICAL ERROR: Библиотека 'aiogram' не установлена.")
-    print("Установите: pip install -r requirements.txt")
+    print("CRITICAL ERROR: Библиотеки не установлены.")
+    print("Установите: pip install aiogram pillow")
     exit(1)
 
 logging.basicConfig(
@@ -32,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
 CHANNEL = "@RavionScripts"
+WATERMARK_TEXT = "@RavionScripts"
 WATERMARK_URL = "https://t.me/RavionScripts"
 ADMIN_ID = 7637946765
 MODERATOR_ID = 6510703948
@@ -43,6 +47,90 @@ scheduled_posts: Dict[str, Dict[str, Any]] = {}
 class PostStates(StatesGroup):
     waiting_content = State()
     waiting_time = State()
+
+def add_watermarks(image_bytes: bytes) -> bytes:
+    """Добавляет множество полупрозрачных водяных знаков на изображение"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        width, height = image.size
+        image = image.convert('RGBA')
+        
+        watermark_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(watermark_layer)
+        
+        # Размер шрифта - 8% от меньшей стороны
+        min_dimension = min(width, height)
+        font_size = int(min_dimension * 0.08)
+        
+        # Загружаем шрифт
+        try:
+            font = ImageFont.truetype("/system/fonts/Roboto-Bold.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            except:
+                try:
+                    font = ImageFont.truetype("C:\\Windows\\Fonts\\arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+        
+        # Получаем размер текста
+        bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        # Случайное количество водяных знаков от 8 до 13
+        num_watermarks = random.randint(8, 13)
+        
+        # Прозрачность 80% = 255 * 0.2 = 51 (20% непрозрачности)
+        opacity = 51
+        
+        # Генерируем случайные позиции
+        positions = []
+        for _ in range(num_watermarks):
+            # Случайные координаты с учётом размера текста
+            x = random.randint(-text_width // 2, width - text_width // 2)
+            y = random.randint(-text_height // 2, height - text_height // 2)
+            
+            # Случайный угол наклона от -45 до 45 градусов
+            angle = random.randint(-45, 45)
+            
+            positions.append((x, y, angle))
+        
+        # Рисуем водяные знаки
+        for x, y, angle in positions:
+            # Создаём временный слой для поворота
+            temp_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+            temp_draw = ImageDraw.Draw(temp_layer)
+            
+            # Рисуем текст
+            temp_draw.text(
+                (x, y),
+                WATERMARK_TEXT,
+                font=font,
+                fill=(255, 255, 255, opacity)
+            )
+            
+            # Поворачиваем
+            if angle != 0:
+                rotated = temp_layer.rotate(angle, expand=False, resample=Image.BICUBIC)
+                watermark_layer = Image.alpha_composite(watermark_layer, rotated)
+            else:
+                watermark_layer = Image.alpha_composite(watermark_layer, temp_layer)
+        
+        # Объединяем слои
+        result = Image.alpha_composite(image, watermark_layer)
+        
+        # Сохраняем в bytes
+        output = io.BytesIO()
+        result.convert('RGB').save(output, format='PNG', quality=95)
+        output.seek(0)
+        
+        return output.read()
+        
+    except Exception as e:
+        logger.error(f"Ошибка добавления водяных знаков: {e}")
+        return image_bytes
 
 def process_script_logic(text: str) -> list:
     code_lines = []
@@ -154,17 +242,17 @@ def get_channel_button() -> InlineKeyboardMarkup:
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="➕ Новый пост")],
-        [KeyboardButton(text="📋 Мои посты"), KeyboardButton(text="📊 Статистика")]
+        [KeyboardButton(text="Новый пост")],
+        [KeyboardButton(text="Мои посты"), KeyboardButton(text="Статистика")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_action_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish')],
-        [InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')],
-        [InlineKeyboardButton(text="✏️ Изменить", callback_data='edit')],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data='cancel')]
+        [InlineKeyboardButton(text="Опубликовать", callback_data='publish')],
+        [InlineKeyboardButton(text="Отложить", callback_data='schedule')],
+        [InlineKeyboardButton(text="Изменить", callback_data='edit')],
+        [InlineKeyboardButton(text="Отменить", callback_data='cancel')]
     ])
 
 def parse_time(time_str: str) -> datetime | None:
@@ -232,79 +320,44 @@ async def cmd_start(message: Message, state: FSMContext):
     
     username = message.from_user.first_name or "Администратор"
     
-    welcome_text = f"""━━━━━━━━━━━━━━━━━━━
-👋  Привет, {username}!
-━━━━━━━━━━━━━━━━━━━
-
-🤖  Я помогу создавать посты для канала
-
-📝  Формат сообщения:
-
-Название игры
-Описание (необязательно)
-#key или #nokey
-loadstring(game:HttpGet(...))()
-
-📸  Можно прикрепить фото
-⏰  Можно отложить публикацию
-
-━━━━━━━━━━━━━━━━━━━
-
-Нажми "➕ Новый пост" чтобы начать"""
-    
     await message.answer(
-        welcome_text,
-        reply_markup=get_main_keyboard(),
-        parse_mode='Markdown'
+        f"Привет, {username}!\n\n"
+        f"Я помогу создавать посты для канала {CHANNEL}\n\n"
+        f"Формат сообщения:\n"
+        f"Название игры\n"
+        f"Описание (необязательно)\n"
+        f"#key или #nokey\n"
+        f"loadstring(game:HttpGet(...))())\n\n"
+        f"Можно прикрепить фото (автоматически добавлю водяные знаки)\n\n"
+        f"Нажми 'Новый пост' чтобы начать",
+        reply_markup=get_main_keyboard()
     )
 
-@router.message(F.text == "➕ Новый пост")
+@router.message(F.text == "Новый пост")
 async def new_post(message: Message, state: FSMContext):
     if not check_access(message.from_user.id):
         return
     
-    help_text = """━━━━━━━━━━━━━━━━━━━
-📝  СОЗДАНИЕ ПОСТА
-━━━━━━━━━━━━━━━━━━━
-
-Пример 1 (с ключом):
-
-Blox Fruits
-Лучший скрипт для фарма
-#key
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-Пример 2 (без ключа):
-
-Pet Simulator X
-#nokey
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-Пример 3 (минимальный):
-
-Arsenal
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-💡  Можешь прикрепить фото к сообщению
-❌  /cancel для отмены"""
-    
     await state.set_state(PostStates.waiting_content)
-    await message.answer(help_text, parse_mode='Markdown')
+    await message.answer(
+        "Отправь контент поста\n\n"
+        "Пример:\n"
+        "Blox Fruits\n"
+        "Лучший скрипт для фарма\n"
+        "#key\n"
+        "loadstring(game:HttpGet('ссылка'))()\n\n"
+        "Можешь прикрепить фото\n"
+        "/cancel для отмены"
+    )
 
-@router.message(F.text == "📋 Мои посты")
+@router.message(F.text == "Мои посты")
 async def my_posts(message: Message):
     if not check_access(message.from_user.id):
         return
     
     await show_scheduled(message, message.from_user.id)
 
-@router.message(F.text == "📊 Статистика")
+@router.message(F.text == "Статистика")
 async def stats(message: Message):
     if not check_access(message.from_user.id):
         return
@@ -312,17 +365,12 @@ async def stats(message: Message):
     user_id = message.from_user.id
     count = len([p for p in scheduled_posts.values() if p['user_id'] == user_id])
     
-    stats_text = f"""━━━━━━━━━━━━━━━━━━━
-📊  СТАТИСТИКА
-━━━━━━━━━━━━━━━━━━━
-
-⏰  Постов в очереди: {count}
-📢  Канал: {CHANNEL}
-🤖  Статус: Активен ✅
-
-━━━━━━━━━━━━━━━━━━━"""
-    
-    await message.answer(stats_text, parse_mode='Markdown')
+    await message.answer(
+        f"Статистика:\n\n"
+        f"Постов в очереди: {count}\n"
+        f"Канал: {CHANNEL}\n"
+        f"Статус: Активен ✅"
+    )
 
 @router.message(Command("cancel"))
 async def cancel_action(message: Message, state: FSMContext):
@@ -330,35 +378,56 @@ async def cancel_action(message: Message, state: FSMContext):
         return
     
     await state.clear()
-    await message.answer("❌  Действие отменено", reply_markup=get_main_keyboard())
+    await message.answer("Действие отменено", reply_markup=get_main_keyboard())
 
 @router.message(PostStates.waiting_content)
-async def process_content(message: Message, state: FSMContext):
+async def process_content(message: Message, state: FSMContext, bot: Bot):
     if not check_access(message.from_user.id):
         return
     
     user_id = message.from_user.id
     
     photo_id = None
+    photo_bytes = None
     text_content = ""
     
+    # Обработка фото с водяными знаками
     if message.photo:
-        photo_id = message.photo[-1].file_id
+        status = await message.answer("Добавляю водяные знаки на фото...")
+        
+        file = await bot.get_file(message.photo[-1].file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+        
+        # Добавляем водяные знаки
+        watermarked_bytes = add_watermarks(photo_bytes.read())
+        photo_id = watermarked_bytes
+        
+        await status.delete()
         text_content = message.caption or ""
+        
     elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
-        photo_id = message.document.file_id
+        status = await message.answer("Добавляю водяные знаки на изображение...")
+        
+        file = await bot.get_file(message.document.file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+        
+        # Добавляем водяные знаки
+        watermarked_bytes = add_watermarks(photo_bytes.read())
+        photo_id = watermarked_bytes
+        
+        await status.delete()
         text_content = message.caption or ""
     else:
         text_content = message.text or ""
     
     if not text_content.strip():
-        await message.answer("⚠️  Пожалуйста, отправьте текст поста")
+        await message.answer("Пожалуйста, отправьте текст поста")
         return
     
     parsed = parse_content(text_content)
     
     if not parsed['game']:
-        await message.answer("⚠️  Не удалось определить название игры\nПервая строка должна быть названием")
+        await message.answer("Не удалось определить название игры. Первая строка должна быть названием")
         return
     
     user_data[user_id] = {
@@ -381,14 +450,12 @@ async def process_schedule_time(message: Message, state: FSMContext):
     stime = parse_time(message.text)
     if not stime:
         await message.answer(
-            "⚠️  Неверный формат времени\n\n"
+            "Неверный формат времени\n\n"
             "Примеры:\n"
-            "• 14:30 - сегодня в 14:30\n"
-            "• 2ч - через 2 часа\n"
-            "• 30м - через 30 минут\n"
-            "• 1ч30м - через 1.5 часа\n"
-            "• завтра 10:00 - завтра в 10:00",
-            parse_mode='Markdown'
+            "14:30 - сегодня в 14:30\n"
+            "2ч - через 2 часа\n"
+            "30м - через 30 минут\n"
+            "завтра 10:00 - завтра в 10:00"
         )
         return
     
@@ -407,14 +474,10 @@ async def process_schedule_time(message: Message, state: FSMContext):
     asyncio.create_task(schedule_bg_task(message.bot, pid))
     
     await message.answer(
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅  ПОСТ ЗАПЛАНИРОВАН\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎮  {d['game']}\n"
-        f"⏰  {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Посмотреть очередь: 📋 Мои посты",
-        parse_mode='Markdown',
+        f"Пост запланирован\n\n"
+        f"Игра: {d['game']}\n"
+        f"Время: {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Посмотреть очередь: Мои посты",
         reply_markup=get_main_keyboard()
     )
     
@@ -424,7 +487,7 @@ async def process_schedule_time(message: Message, state: FSMContext):
 @router.callback_query(F.data == 'publish')
 async def callback_publish(callback: CallbackQuery, state: FSMContext):
     if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("Нет доступа", show_alert=True)
         return
     
     await publish_now(callback.message, callback.from_user.id, callback.bot)
@@ -434,65 +497,54 @@ async def callback_publish(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == 'schedule')
 async def callback_schedule(callback: CallbackQuery, state: FSMContext):
     if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("Нет доступа", show_alert=True)
         return
     
     await state.set_state(PostStates.waiting_time)
     await callback.message.answer(
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "⏰  КОГДА ОПУБЛИКОВАТЬ?\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "Когда опубликовать?\n\n"
         "Примеры:\n"
-        "• 14:30 - сегодня в 14:30\n"
-        "• 2ч - через 2 часа\n"
-        "• 30м - через 30 минут\n"
-        "• 1ч30м - через 1 час 30 мин\n"
-        "• завтра 10:00 - завтра в 10:00",
-        parse_mode='Markdown'
+        "14:30 - сегодня в 14:30\n"
+        "2ч - через 2 часа\n"
+        "30м - через 30 минут\n"
+        "завтра 10:00 - завтра в 10:00"
     )
     await callback.answer()
 
 @router.callback_query(F.data == 'edit')
 async def callback_edit(callback: CallbackQuery, state: FSMContext):
     if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("Нет доступа", show_alert=True)
         return
     
     await state.set_state(PostStates.waiting_content)
-    await callback.message.answer(
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "✏️  РЕДАКТИРОВАНИЕ\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
-        "Отправь новый контент в том же формате\n"
-        "Все данные будут обновлены",
-        parse_mode='Markdown'
-    )
+    await callback.message.answer("Отправь новый контент в том же формате")
     await callback.answer()
 
 @router.callback_query(F.data == 'cancel')
 async def callback_cancel(callback: CallbackQuery, state: FSMContext):
     if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("Нет доступа", show_alert=True)
         return
     
     user_id = callback.from_user.id
     user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
     
     await state.clear()
-    await callback.message.answer("❌  Пост отменён", reply_markup=get_main_keyboard())
+    await callback.message.answer("Пост отменён", reply_markup=get_main_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data.startswith('del_'))
 async def callback_delete_scheduled(callback: CallbackQuery):
     if not check_access(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("Нет доступа", show_alert=True)
         return
     
     pid = callback.data.replace('del_', '')
     if pid in scheduled_posts:
         game_name = scheduled_posts[pid].get('game', 'Пост')
         del scheduled_posts[pid]
-        await callback.answer(f"✅ {game_name} удалён", show_alert=True)
+        await callback.answer(f"{game_name} удалён", show_alert=True)
         await show_scheduled(callback.message, callback.from_user.id)
     await callback.answer()
 
@@ -500,32 +552,32 @@ async def show_preview(message: Message, user_id: int):
     d = user_data[user_id]
     text = format_post(d['game'], d['desc'], d['key'], d['code'])
     
-    preview_header = "━━━━━━━━━━━━━━━━━━━\n👀  ПРЕДПРОСМОТР\n━━━━━━━━━━━━━━━━━━━\n\n"
-    
     try:
         if d.get('photo'):
-            await message.answer_photo(
-                photo=d['photo'], 
-                caption=preview_header + text, 
-                parse_mode='Markdown', 
-                reply_markup=get_action_keyboard()
-            )
+            if isinstance(d['photo'], bytes):
+                photo_file = BufferedInputFile(d['photo'], filename='watermarked.png')
+                await message.answer_photo(
+                    photo=photo_file, 
+                    caption="Предпросмотр:\n\n" + text, 
+                    parse_mode='Markdown', 
+                    reply_markup=get_action_keyboard()
+                )
+            else:
+                await message.answer_photo(
+                    photo=d['photo'], 
+                    caption="Предпросмотр:\n\n" + text, 
+                    parse_mode='Markdown', 
+                    reply_markup=get_action_keyboard()
+                )
         else:
             await message.answer(
-                preview_header + text, 
+                "Предпросмотр:\n\n" + text, 
                 parse_mode='Markdown', 
                 reply_markup=get_action_keyboard()
             )
     except Exception as e:
         logger.error(f"Ошибка предпросмотра: {e}")
-        await message.answer(
-            "⚠️  Ошибка отображения\n\n"
-            "Возможные причины:\n"
-            "• Текст слишком длинный\n"
-            "• Неверный формат Markdown\n"
-            "• Проблема с фото\n\n"
-            "Попробуйте заново создать пост"
-        )
+        await message.answer("Ошибка отображения. Попробуйте заново создать пост")
 
 async def publish_now(message: Message, user_id: int, bot: Bot):
     d = user_data[user_id]
@@ -534,13 +586,23 @@ async def publish_now(message: Message, user_id: int, bot: Bot):
     
     try:
         if d.get('photo'):
-            await bot.send_photo(
-                chat_id=CHANNEL, 
-                photo=d['photo'], 
-                caption=text, 
-                parse_mode='Markdown', 
-                reply_markup=markup
-            )
+            if isinstance(d['photo'], bytes):
+                photo_file = BufferedInputFile(d['photo'], filename='watermarked.png')
+                await bot.send_photo(
+                    chat_id=CHANNEL, 
+                    photo=photo_file, 
+                    caption=text, 
+                    parse_mode='Markdown', 
+                    reply_markup=markup
+                )
+            else:
+                await bot.send_photo(
+                    chat_id=CHANNEL, 
+                    photo=d['photo'], 
+                    caption=text, 
+                    parse_mode='Markdown', 
+                    reply_markup=markup
+                )
         else:
             await bot.send_message(
                 chat_id=CHANNEL, 
@@ -550,30 +612,16 @@ async def publish_now(message: Message, user_id: int, bot: Bot):
             )
         
         await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"✅  УСПЕШНО ОПУБЛИКОВАНО\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎮  {d['game']}\n"
-            f"📢  {CHANNEL}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━",
-            parse_mode='Markdown',
+            f"Успешно опубликовано\n\n"
+            f"Игра: {d['game']}\n"
+            f"Канал: {CHANNEL}",
             reply_markup=get_main_keyboard()
         )
         
         user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
-        await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"❌  ОШИБКА ПУБЛИКАЦИИ\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{str(e)[:200]}\n\n"
-            f"Проверьте:\n"
-            f"• Бот админ в {CHANNEL}\n"
-            f"• Есть права на публикацию\n"
-            f"• Канал существует",
-            parse_mode='Markdown'
-        )
+        await message.answer(f"Ошибка публикации: {str(e)[:200]}")
 
 async def schedule_bg_task(bot: Bot, pid: str):
     while pid in scheduled_posts:
@@ -582,13 +630,23 @@ async def schedule_bg_task(bot: Bot, pid: str):
             try:
                 markup = get_channel_button()
                 if post.get('photo'):
-                    await bot.send_photo(
-                        chat_id=CHANNEL, 
-                        photo=post['photo'], 
-                        caption=post['text'], 
-                        parse_mode='Markdown', 
-                        reply_markup=markup
-                    )
+                    if isinstance(post['photo'], bytes):
+                        photo_file = BufferedInputFile(post['photo'], filename='watermarked.png')
+                        await bot.send_photo(
+                            chat_id=CHANNEL, 
+                            photo=photo_file, 
+                            caption=post['text'], 
+                            parse_mode='Markdown', 
+                            reply_markup=markup
+                        )
+                    else:
+                        await bot.send_photo(
+                            chat_id=CHANNEL, 
+                            photo=post['photo'], 
+                            caption=post['text'], 
+                            parse_mode='Markdown', 
+                            reply_markup=markup
+                        )
                 else:
                     await bot.send_message(
                         chat_id=CHANNEL, 
@@ -599,15 +657,13 @@ async def schedule_bg_task(bot: Bot, pid: str):
                 
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"━━━━━━━━━━━━━━━━━━━\n✅  ПОСТ ОПУБЛИКОВАН\n━━━━━━━━━━━━━━━━━━━\n\n🎮  {post['game']}\n📢  {CHANNEL}", 
-                    parse_mode='Markdown'
+                    text=f"Пост опубликован\n\nИгра: {post['game']}\nКанал: {CHANNEL}"
                 )
             except Exception as e:
                 logger.error(f"Ошибка отложенной публикации: {e}")
                 await bot.send_message(
                     chat_id=post['user_id'], 
-                    text=f"❌  Ошибка публикации:\n{str(e)[:200]}",
-                    parse_mode='Markdown'
+                    text=f"Ошибка публикации: {str(e)[:200]}"
                 )
             
             if pid in scheduled_posts:
@@ -619,16 +675,10 @@ async def show_scheduled(message: Message, user_id: int):
     posts = {k: v for k, v in scheduled_posts.items() if v['user_id'] == user_id}
     
     if not posts:
-        await message.answer(
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "📭  НЕТ ЗАПЛАНИРОВАННЫХ ПОСТОВ\n"
-            "━━━━━━━━━━━━━━━━━━━\n\n"
-            "Создайте новый пост и отложите его",
-            parse_mode='Markdown'
-        )
+        await message.answer("Нет запланированных постов\n\nСоздайте новый пост и отложите его")
         return
 
-    text = "━━━━━━━━━━━━━━━━━━━\n📅  ЗАПЛАНИРОВАННЫЕ ПОСТЫ\n━━━━━━━━━━━━━━━━━━━\n\n"
+    text = "Запланированные посты:\n\n"
     kb = []
     
     for pid, p in sorted(posts.items(), key=lambda x: x[1]['time']):
@@ -644,29 +694,26 @@ async def show_scheduled(message: Message, user_id: int):
         else:
             countdown = f"через {minutes_left}м"
         
-        text += f"🎮  {game_title}\n⏰  {time_str} ({countdown})\n\n"
+        text += f"{game_title}\n{time_str} ({countdown})\n\n"
         kb.append([InlineKeyboardButton(
             text=f"❌ {game_title}", 
             callback_data=f'del_{pid}'
         )])
     
-    text += "━━━━━━━━━━━━━━━━━━━"
-    
     await message.answer(
         text, 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), 
-        parse_mode='Markdown'
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
 
 async def main():
-    logger.info("🚀 Запуск бота...")
+    logger.info("Запуск бота...")
     
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     
     dp.include_router(router)
     
-    logger.info(f"✅ Бот запущен! Канал: {CHANNEL}")
+    logger.info(f"Бот запущен! Канал: {CHANNEL}")
     
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=['message', 'callback_query'])
@@ -675,6 +722,6 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("⛔ Бот остановлен")
+        logger.info("Бот остановлен")
     except Exception as e:
-        logger.error(f"💥 CRITICAL ERROR: {e}")
+        logger.error(f"CRITICAL ERROR: {e}")
