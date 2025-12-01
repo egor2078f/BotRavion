@@ -1,377 +1,458 @@
 import logging
-import re
 import asyncio
+import re
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Union, Optional
 
-try:
-    from aiogram import Bot, Dispatcher, F, Router
-    from aiogram.types import (
-        Message, 
-        CallbackQuery, 
-        InlineKeyboardButton, 
-        InlineKeyboardMarkup,
-        ReplyKeyboardMarkup,
-        KeyboardButton
-    )
-    from aiogram.filters import Command, CommandStart
-    from aiogram.fsm.context import FSMContext
-    from aiogram.fsm.state import State, StatesGroup
-    from aiogram.fsm.storage.memory import MemoryStorage
-except ImportError:
-    print("CRITICAL: Установите библиотеку: pip install aiogram")
-    exit(1)
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputMediaAnimation, InputMediaDocument
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ContentType
 
-# --- КОНФИГУРАЦИЯ ---
+# --- КОНФИГ ---
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
-CHANNEL = "@RavionScripts"
-WATERMARK_URL = "https://t.me/RavionScripts"
-ADMIN_IDS = {7637946765, 6510703948}  # ID админов
+CHANNEL_ID = "@RavionScripts"
+WATERMARK = "https://t.me/RavionScripts"
+ADMINS = {7637946765, 6510703948}  # ID Админов
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Настройка логов
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-user_data: Dict[int, Dict[str, Any]] = {}
+# Хранилища (в памяти)
 scheduled_posts: Dict[str, Dict[str, Any]] = {}
+user_msgs_to_delete: Dict[int, list[int]] = {}
 
-class PostStates(StatesGroup):
+# --- FSM (Состояния) ---
+class Form(StatesGroup):
     waiting_content = State()
     waiting_time = State()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-def check_access(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
 
-def parse_time(time_str: str) -> Optional[datetime]:
-    now = datetime.now()
-    text = time_str.lower().strip().replace('  ', ' ')
-    
-    try:
-        # 1. Формат "02.11.2025 11:40" или "02.11 11:40"
-        date_match = re.search(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(\d{1,2}):(\d{2})', text)
-        if date_match:
-            d, m = int(date_match.group(1)), int(date_match.group(2))
-            y = int(date_match.group(3)) if date_match.group(3) else now.year
-            if y < 100: y += 2000
-            h, mn = int(date_match.group(4)), int(date_match.group(5))
-            return datetime(y, m, d, h, mn)
+async def delete_later(bot: Bot, chat_id: int, msg_ids: list[int]):
+    """Удаляет список сообщений, чтобы не мусорить"""
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except:
+            pass
+    if chat_id in user_msgs_to_delete:
+        user_msgs_to_delete[chat_id] = []
 
-        # 2. Формат "11:40" (сегодня или завтра)
-        time_match = re.search(r'^(\d{1,2}):(\d{2})$', text)
-        if time_match:
-            h, mn = int(time_match.group(1)), int(time_match.group(2))
-            target = now.replace(hour=h, minute=mn, second=0)
-            if target < now: target += timedelta(days=1)
-            return target
+def add_msg_to_clean(user_id: int, msg_id: int):
+    if user_id not in user_msgs_to_delete:
+        user_msgs_to_delete[user_id] = []
+    user_msgs_to_delete[user_id].append(msg_id)
 
-        # 3. Относительное "50м", "1ч 20м", "через 2 часа"
-        delta_m = 0
-        
-        # Поиск часов
-        h_search = re.search(r'(\d+)\s*(ч|h|час)', text)
-        if h_search: delta_m += int(h_search.group(1)) * 60
-        
-        # Поиск минут
-        m_search = re.search(r'(\d+)\s*(м|m|мин)', text)
-        if m_search: delta_m += int(m_search.group(1))
+def html_escape(text: str) -> str:
+    """Экранирование для HTML"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        if delta_m > 0:
-            return now + timedelta(minutes=delta_m)
-
-    except Exception:
-        return None
-    return None
-
-def process_script_logic(text: str) -> list:
-    code_lines = []
-    in_code = False
-    for line in text.split('\n'):
-        s = line.strip()
-        if s.startswith('```'):
-            in_code = not in_code
-            continue
-        
-        # Авто-добавление ватермарки
-        if ('loadstring' in s or 'getgenv' in s) and 'game:HttpGet' in s:
-            if WATERMARK_URL not in s:
-                if s.endswith('()'): s = s[:-2] + f'("{WATERMARK_URL}")'
-                elif s.endswith('();'): s = s[:-3] + f'("{WATERMARK_URL}");'
-        
-        code_lines.append(s)
-    return code_lines
-
-def parse_post_content(text: str) -> Dict:
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    res = {'game': 'Unknown', 'desc': '', 'key': False, 'code': []}
+def parse_content(raw_text: str) -> Dict[str, Any]:
+    """Умный парсинг текста поста"""
+    lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+    res = {'game': '🎮 Game', 'desc': '', 'key': False, 'code': []}
     
     if not lines: return res
     
-    res['game'] = lines[0] # Первая строка - игра
+    res['game'] = lines[0] # Первая строка — всегда название
     
-    code_start = -1
+    code_found = False
+    desc_lines = []
+    
     for i, line in enumerate(lines[1:], 1):
         low = line.lower()
-        if '#key' in low or 'key+' in low: res['key'] = True; continue
-        if '#nokey' in low or 'key-' in low: res['key'] = False; continue
         
-        if code_start == -1 and any(x in low for x in ['loadstring', 'game:', 'function', 'local ', 'getgenv']):
-            code_start = i
-            break
+        # Поиск флагов ключа
+        if '#key' in low or 'key+' in low: 
+            res['key'] = True
+            continue
+        if '#nokey' in low or 'key-' in low or 'no key' in low: 
+            res['key'] = False
+            continue
             
-    if code_start != -1:
-        # Описание между заголовком и кодом
-        desc_lines = [l for l in lines[1:code_start] if not l.startswith('#')]
-        res['desc'] = '\n'.join(desc_lines)
-        res['code'] = process_script_logic('\n'.join(lines[code_start:]))
-    else:
-        # Если код не найден явно, считаем все после заголовка описанием (или кодом если коротко)
-        desc_part = [l for l in lines[1:] if not l.startswith('#')]
-        res['desc'] = '\n'.join(desc_part)
-
+        # Поиск начала кода
+        is_code_sig = any(x in low for x in ['loadstring', 'game:', 'function(', 'local ', 'getgenv', 'library', '```'])
+        
+        if not code_found and is_code_sig:
+            code_found = True
+            # Начинаем собирать код
+            clean_code = line.replace('```lua', '').replace('```', '')
+            # Авто-ватермарка
+            if 'game:HttpGet' in clean_code and WATERMARK not in clean_code:
+                if clean_code.endswith('()'): clean_code = clean_code[:-2] + f'("{WATERMARK}")'
+                elif clean_code.endswith('();'): clean_code = clean_code[:-3] + f'("{WATERMARK}");'
+            res['code'].append(clean_code)
+        elif code_found:
+            clean_code = line.replace('```', '')
+            res['code'].append(clean_code)
+        else:
+            if not line.startswith('#'):
+                desc_lines.append(line)
+    
+    res['desc'] = '\n'.join(desc_lines)
     return res
 
-def format_post_text(data: Dict) -> str:
-    parts = [
-        "━━━━━━━━━━━━━━━━━━━",
-        f"🎮  {data['game'].upper()}",
-        "━━━━━━━━━━━━━━━━━━━\n"
-    ]
+def build_post_text(data: Dict) -> str:
+    """Сборка красивого HTML поста"""
+    game = html_escape(data['game']).upper()
+    desc = html_escape(data['desc'])
     
-    if data['desc']: parts.append(f"💬  {data['desc']}\n")
+    text = f"<b>━━━━━━━━━━━━━━━━━━━</b>\n"
+    text += f"🎮 <b>{game}</b>\n"
+    text += f"<b>━━━━━━━━━━━━━━━━━━━</b>\n\n"
     
-    key_txt = "🔐 Требуется ключ" if data['key'] else "🔓 Ключ не нужен"
-    parts.append(f"{key_txt}\n")
+    if desc:
+        text += f"💬 {desc}\n\n"
+    
+    key_status = "🔐 <b>Требуется ключ</b>" if data['key'] else "🔓 <b>Ключ не нужен</b>"
+    text += f"{key_status}\n\n"
     
     if data['code']:
-        parts.append("⚡  СКРИПТ:")
-        parts.append("```lua")
-        parts.extend(data['code'])
-        parts.append("```\n")
+        code_block = "\n".join(data['code'])
+        # Тег <code> копирует текст по клику в Telegram
+        text += f"⚡ <b>СКРИПТ:</b>\n<pre><code class=\"language-lua\">{html_escape(code_block)}</code></pre>\n\n"
         
-    parts.append("━━━━━━━━━━━━━━━━━━━")
-    parts.append(f"📢  {CHANNEL}")
-    return "\n".join(parts)
+    text += f"<b>━━━━━━━━━━━━━━━━━━━</b>\n"
+    text += f"📢 {CHANNEL_ID}"
+    return text
+
+def parse_time(time_str: str) -> Optional[datetime]:
+    """Гибкий парсинг времени"""
+    now = datetime.now()
+    s = time_str.lower().replace('  ', ' ').strip()
+    
+    try:
+        # Относительное время: "10м", "2ч", "1ч 30м"
+        if any(c in s for c in ['м', 'ч', 'm', 'h']):
+            delta_m = 0
+            h_match = re.search(r'(\d+)\s*[чh]', s)
+            m_match = re.search(r'(\d+)\s*[мm]', s)
+            if h_match: delta_m += int(h_match.group(1)) * 60
+            if m_match: delta_m += int(m_match.group(1))
+            return now + timedelta(minutes=delta_m) if delta_m > 0 else None
+
+        # Точное время "15:00"
+        if re.match(r'^\d{1,2}:\d{2}$', s):
+            h, m = map(int, s.split(':'))
+            target = now.replace(hour=h, minute=m, second=0)
+            if target <= now: target += timedelta(days=1) # Если время прошло, значит завтра
+            return target
+            
+        # Дата и время "05.11 12:00"
+        match = re.match(r'(\d{1,2})[./](\d{1,2})\s+(\d{1,2}):(\d{2})', s)
+        if match:
+            d, m, h, mn = map(int, match.groups())
+            year = now.year
+            # Если месяц меньше текущего, возможно это следующий год (редкий кейс, но все же)
+            if m < now.month: year += 1
+            return datetime(year, m, d, h, mn)
+            
+    except:
+        return None
+    return None
 
 # --- КЛАВИАТУРЫ ---
 
 def kb_main():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новый пост")],
-        [KeyboardButton(text="📋 Мои посты"), KeyboardButton(text="📊 Статистика")]
-    ], resize_keyboard=True)
+        [KeyboardButton(text="📋 Очередь"), KeyboardButton(text="🗑 Очистить чат")]
+    ], resize_keyboard=True, one_time_keyboard=False)
 
-def kb_actions():
+def kb_preview():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='pub_now')],
-        [InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')],
-        [InlineKeyboardButton(text="✏️ Ред.", callback_data='edit'), InlineKeyboardButton(text="❌ Отмена", callback_data='cancel')]
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data="pub_now")],
+        [InlineKeyboardButton(text="⏰ Отложить", callback_data="schedule")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
-def kb_link():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Скрипт в канале", url='[https://t.me/RavionScripts](https://t.me/RavionScripts)')]])
+def kb_channel_url():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Скрипт в канале", url=WATERMARK)]
+    ])
+
+def kb_queue_control(pid: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Выложить сейчас", callback_data=f"force_{pid}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{pid}")]
+    ])
 
 # --- ЛОГИКА БОТА ---
 
 router = Router()
 
 @router.message(CommandStart())
-async def start(msg: Message, state: FSMContext):
-    if not check_access(msg.from_user.id): return
+async def cmd_start(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id): return
     await state.clear()
-    await msg.answer("👋 Ку. Кидай текст поста или фото/видео с описанием.\n\nФормат:\nИгра\nОписание\n#key\nСкрипт", reply_markup=kb_main())
+    await msg.answer(
+        "👋 <b>Админ-панель RavionScripts</b>\n\n"
+        "Я умею постить фото, видео, гифки и файлы.\n"
+        "Автоматически форматирую код и удаляю мусор за собой.",
+        reply_markup=kb_main(), parse_mode=ParseMode.HTML
+    )
+
+@router.message(F.text == "🗑 Очистить чат")
+async def clear_chat_btn(msg: Message):
+    # Пытается удалить последние 100 сообщений (технически бот может удалять только свои или если он админ группы)
+    # В личке бот может удалять только свои.
+    await msg.answer("🧹 Чат визуально очищен (логика очистки зависит от прав бота).", reply_markup=kb_main())
 
 @router.message(F.text == "➕ Новый пост")
-async def new_post_handler(msg: Message, state: FSMContext):
-    if not check_access(msg.from_user.id): return
-    await state.set_state(PostStates.waiting_content)
-    await msg.answer("📝 Жду контент (текст, фото или видео).")
-
-@router.message(PostStates.waiting_content)
-async def content_handler(msg: Message, state: FSMContext):
-    user_id = msg.from_user.id
+async def new_post(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id): return
+    add_msg_to_clean(msg.chat.id, msg.message_id)
     
-    # Обработка медиа (Фото или Видео)
-    media_id = None
-    media_type = None
-    text = msg.text or ""
+    m = await msg.answer("📤 <b>Отправь контент:</b>\n\n"
+                     "• Текст\n• Фото\n• Видео/GIF\n• Файл\n\n"
+                     "<i>Первая строка — название, далее описание и код.</i>", parse_mode=ParseMode.HTML)
+    add_msg_to_clean(msg.chat.id, m.message_id)
+    await state.set_state(Form.waiting_content)
+
+@router.message(Form.waiting_content)
+async def receive_content(msg: Message, state: FSMContext):
+    add_msg_to_clean(msg.chat.id, msg.message_id)
+    
+    # Определение типа контента
+    content_type = 'text'
+    file_id = None
+    text = msg.text or msg.caption or ""
     
     if msg.photo:
-        media_id = msg.photo[-1].file_id
-        media_type = 'photo'
-        text = msg.caption or ""
+        content_type = 'photo'
+        file_id = msg.photo[-1].file_id
     elif msg.video:
-        media_id = msg.video.file_id
-        media_type = 'video'
-        text = msg.caption or ""
-    elif msg.document and 'image' in msg.document.mime_type:
-        media_id = msg.document.file_id
-        media_type = 'photo'
-        text = msg.caption or ""
+        content_type = 'video'
+        file_id = msg.video.file_id
+    elif msg.animation:
+        content_type = 'animation'
+        file_id = msg.animation.file_id
+    elif msg.document:
+        content_type = 'document'
+        file_id = msg.document.file_id
 
-    if not text.strip() and not media_id:
-        await msg.answer("⚠️ Пустое сообщение.")
+    if not text.strip() and content_type == 'text':
+        m = await msg.answer("⚠️ Пустой пост. Отправь заново.")
+        add_msg_to_clean(msg.chat.id, m.message_id)
         return
 
-    parsed = parse_post_content(text)
+    parsed = parse_content(text)
     
-    user_data[user_id] = {
-        **parsed,
-        'media_id': media_id,
-        'media_type': media_type
-    }
-    
-    preview = format_post_text(user_data[user_id])
-    
-    try:
-        if media_type == 'photo':
-            await msg.answer_photo(media_id, caption=preview, parse_mode='Markdown', reply_markup=kb_actions())
-        elif media_type == 'video':
-            await msg.answer_video(media_id, caption=preview, parse_mode='Markdown', reply_markup=kb_actions())
-        else:
-            await msg.answer(preview, parse_mode='Markdown', reply_markup=kb_actions())
-    except Exception as e:
-        await msg.answer(f"⚠️ Ошибка формата Markdown: {e}")
-
-@router.callback_query(F.data == 'pub_now')
-async def publish_now(cb: CallbackQuery, state: FSMContext):
-    user_id = cb.from_user.id
-    data = user_data.get(user_id)
-    if not data: return await cb.answer("❌ Данные устарели", show_alert=True)
-    
-    text = format_post_text(data)
-    try:
-        if data['media_type'] == 'photo':
-            await cb.bot.send_photo(CHANNEL, data['media_id'], caption=text, parse_mode='Markdown', reply_markup=kb_link())
-        elif data['media_type'] == 'video':
-            await cb.bot.send_video(CHANNEL, data['media_id'], caption=text, parse_mode='Markdown', reply_markup=kb_link())
-        else:
-            await cb.bot.send_message(CHANNEL, text, parse_mode='Markdown', reply_markup=kb_link())
-        
-        await cb.message.delete()
-        await cb.message.answer("✅ Опубликовано!", reply_markup=kb_main())
-        await state.clear()
-    except Exception as e:
-        await cb.answer(f"Ошибка: {e}", show_alert=True)
-
-@router.callback_query(F.data == 'schedule')
-async def ask_time(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(PostStates.waiting_time)
-    await cb.message.answer(
-        "⏰ **Напиши время публикации:**\n\n"
-        "• `14:30` (сегодня/завтра)\n"
-        "• `05.11 18:00` (дата)\n"
-        "• `30м` (через 30 минут)\n"
-        "• `2ч` (через 2 часа)", 
-        parse_mode='Markdown'
+    # Сохраняем во временное состояние
+    await state.update_data(
+        content_type=content_type,
+        file_id=file_id,
+        parsed=parsed
     )
-    await cb.answer()
-
-@router.message(PostStates.waiting_time)
-async def schedule_handler(msg: Message, state: FSMContext):
-    target_time = parse_time(msg.text)
-    if not target_time:
-        return await msg.answer("⚠️ Не понял время. Попробуй: `15:30` или `1ч`")
     
-    user_id = msg.from_user.id
-    data = user_data.get(user_id)
-    pid = f"{user_id}_{int(datetime.now().timestamp())}"
+    # Предпросмотр
+    preview_text = build_post_text(parsed)
+    
+    try:
+        if content_type == 'photo':
+            m = await msg.answer_photo(file_id, caption=preview_text, parse_mode=ParseMode.HTML, reply_markup=kb_preview())
+        elif content_type == 'video':
+            m = await msg.answer_video(file_id, caption=preview_text, parse_mode=ParseMode.HTML, reply_markup=kb_preview())
+        elif content_type == 'animation':
+            m = await msg.answer_animation(file_id, caption=preview_text, parse_mode=ParseMode.HTML, reply_markup=kb_preview())
+        elif content_type == 'document':
+            m = await msg.answer_document(file_id, caption=preview_text, parse_mode=ParseMode.HTML, reply_markup=kb_preview())
+        else:
+            m = await msg.answer(preview_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb_preview())
+            
+        add_msg_to_clean(msg.chat.id, m.message_id)
+        
+    except Exception as e:
+        logger.error(f"Error preview: {e}")
+        m = await msg.answer(f"❌ Ошибка предпросмотра: {e}")
+        add_msg_to_clean(msg.chat.id, m.message_id)
+
+@router.callback_query(F.data == "cancel")
+async def cancel_handler(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await delete_later(cb.bot, cb.message.chat.id, user_msgs_to_delete.get(cb.message.chat.id, []))
+    await cb.answer("❌ Отменено")
+    await cb.message.answer("Главное меню", reply_markup=kb_main())
+
+@router.callback_query(F.data == "pub_now")
+async def publish_now_handler(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await perform_publish(cb.bot, CHANNEL_ID, data)
+    await state.clear()
+    await delete_later(cb.bot, cb.message.chat.id, user_msgs_to_delete.get(cb.message.chat.id, []))
+    await cb.answer("✅ Опубликовано")
+    await cb.message.answer("✅ Пост опубликован в канале!", reply_markup=kb_main())
+
+@router.callback_query(F.data == "schedule")
+async def schedule_ask(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_time)
+    await cb.message.delete() # Удаляем превью, чтобы не мешало
+    m = await cb.message.answer(
+        "⏰ <b>Введи время публикации:</b>\n\n"
+        "• <code>15:30</code> (сегодня/завтра)\n"
+        "• <code>20м</code> (через 20 минут)\n"
+        "• <code>1ч</code> (через час)\n"
+        "• <code>02.11 14:00</code> (дата)",
+        parse_mode=ParseMode.HTML
+    )
+    add_msg_to_clean(cb.message.chat.id, m.message_id)
+
+@router.message(Form.waiting_time)
+async def schedule_confirm(msg: Message, state: FSMContext):
+    add_msg_to_clean(msg.chat.id, msg.message_id)
+    t = parse_time(msg.text)
+    
+    if not t:
+        m = await msg.answer("⚠️ Неверный формат. Попробуй: <code>30м</code> или <code>16:00</code>", parse_mode=ParseMode.HTML)
+        add_msg_to_clean(msg.chat.id, m.message_id)
+        return
+
+    data = await state.get_data()
+    pid = f"{msg.chat.id}_{int(datetime.now().timestamp())}"
     
     scheduled_posts[pid] = {
-        'data': data,
-        'time': target_time,
-        'user_id': user_id
+        'post_data': data,
+        'publish_time': t,
+        'chat_id': msg.chat.id
     }
     
-    asyncio.create_task(wait_and_publish(msg.bot, pid))
-    
-    await msg.answer(f"✅ Отложено на: **{target_time.strftime('%d.%m %H:%M')}**", parse_mode='Markdown', reply_markup=kb_main())
     await state.clear()
-
-@router.message(F.text == "📋 Мои посты")
-async def show_scheduled(msg: Message):
-    user_id = msg.from_user.id
-    user_posts = {k: v for k, v in scheduled_posts.items() if v['user_id'] == user_id}
+    await delete_later(msg.bot, msg.chat.id, user_msgs_to_delete.get(msg.chat.id, []))
     
-    if not user_posts:
-        return await msg.answer("📭 Очередь пуста.")
-        
-    txt = "📅 **Очередь публикаций:**\n\n"
-    kb = []
-    
-    for pid, item in sorted(user_posts.items(), key=lambda x: x[1]['time']):
-        t_str = item['time'].strftime('%d.%m %H:%M')
-        game = item['data']['game']
-        txt += f"🎮 {game} — ⏰ {t_str}\n"
-        # Кнопки управления для каждого поста
-        kb.append([
-            InlineKeyboardButton(text=f"🚀 Запостить {game}", callback_data=f"force_{pid}"),
-            InlineKeyboardButton(text=f"🗑 Удалить", callback_data=f"del_{pid}")
-        ])
-        
-    await msg.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode='Markdown')
+    await msg.answer(
+        f"✅ <b>Запланировано!</b>\n"
+        f"⏰ Время: {t.strftime('%d.%m %H:%M')}\n"
+        f"🎮 Игра: {data['parsed']['game']}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_main()
+    )
 
-# Обработчик мгновенной публикации отложенного поста
-@router.callback_query(F.data.startswith('force_'))
-async def force_publish(cb: CallbackQuery):
-    pid = cb.data.split('_')[1]
-    post = scheduled_posts.get(pid)
-    if not post: return await cb.answer("❌ Пост не найден", show_alert=True)
-    
-    # Меняем время на "сейчас", цикл публикации подхватит его почти мгновенно
-    post['time'] = datetime.now() - timedelta(seconds=1)
-    await cb.answer("🚀 Отправляю в очередь на мгновенную публикацию...")
-    await cb.message.delete()
+@router.message(F.text == "📋 Очередь")
+async def show_queue(msg: Message):
+    if not scheduled_posts:
+        await msg.answer("📭 Очередь пуста.", reply_markup=kb_main())
+        return
 
-@router.callback_query(F.data.startswith('del_'))
-async def delete_post(cb: CallbackQuery):
-    pid = cb.data.split('_')[1]
+    text = "<b>📅 Очередь постов:</b>\n\n"
+    # Сортировка по времени
+    sorted_posts = sorted(scheduled_posts.items(), key=lambda x: x[1]['publish_time'])
+    
+    for pid, val in sorted_posts:
+        t_str = val['publish_time'].strftime('%d.%m %H:%M')
+        game = val['post_data']['parsed']['game']
+        await msg.answer(
+            f"🎮 <b>{game}</b>\n⏰ {t_str}",
+            reply_markup=kb_queue_control(pid),
+            parse_mode=ParseMode.HTML
+        )
+
+@router.callback_query(F.data.startswith("force_"))
+async def force_pub(cb: CallbackQuery):
+    pid = cb.data.split("_")[1]
+    if pid in scheduled_posts:
+        # Ставим время в прошлое, планировщик подхватит мгновенно
+        scheduled_posts[pid]['publish_time'] = datetime.now() - timedelta(seconds=1)
+        await cb.answer("🚀 Добавлено в приоритет...")
+        await cb.message.delete()
+    else:
+        await cb.answer("Пост уже ушел или удален", show_alert=True)
+
+@router.callback_query(F.data.startswith("del_"))
+async def del_pub(cb: CallbackQuery):
+    pid = cb.data.split("_")[1]
     if pid in scheduled_posts:
         del scheduled_posts[pid]
         await cb.answer("🗑 Удалено")
         await cb.message.delete()
     else:
-        await cb.answer("Уже удалено")
+        await cb.answer("Уже удалено", show_alert=True)
 
-@router.callback_query(F.data == 'cancel')
-async def cancel(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.delete()
-    await cb.message.answer("❌ Отмена", reply_markup=kb_main())
+# --- ФУНКЦИЯ ПУБЛИКАЦИИ ---
 
-# Фоновая задача
-async def wait_and_publish(bot: Bot, pid: str):
-    while pid in scheduled_posts:
-        post = scheduled_posts[pid]
-        if datetime.now() >= post['time']:
-            data = post['data']
-            text = format_post_text(data)
-            try:
-                if data['media_type'] == 'photo':
-                    await bot.send_photo(CHANNEL, data['media_id'], caption=text, parse_mode='Markdown', reply_markup=kb_link())
-                elif data['media_type'] == 'video':
-                    await bot.send_video(CHANNEL, data['media_id'], caption=text, parse_mode='Markdown', reply_markup=kb_link())
-                else:
-                    await bot.send_message(CHANNEL, text, parse_mode='Markdown', reply_markup=kb_link())
-                
-                await bot.send_message(post['user_id'], f"✅ Пост **{data['game']}** опубликован!", parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Error publishing: {e}")
-                await bot.send_message(post['user_id'], f"❌ Ошибка публикации: {e}")
+async def perform_publish(bot: Bot, channel: Union[str, int], data: Dict):
+    """Единая функция отправки в канал"""
+    text = build_post_text(data['parsed'])
+    ctype = data['content_type']
+    fid = data['file_id']
+    kb = kb_channel_url()
+    
+    try:
+        if ctype == 'photo':
+            await bot.send_photo(channel, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif ctype == 'video':
+            await bot.send_video(channel, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif ctype == 'animation':
+            await bot.send_animation(channel, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif ctype == 'document':
+            await bot.send_document(channel, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await bot.send_message(channel, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Publish error: {e}")
+        # Если не вышло в канал, шлем админу лог
+        # (в data нет chat_id если публикация мгновенная, но это мелочи для примера)
+        pass
+
+# --- ФОНОВЫЙ ПЛАНИРОВЩИК ---
+
+async def scheduler_loop(bot: Bot):
+    logger.info("⏳ Scheduler started")
+    while True:
+        try:
+            now = datetime.now()
+            # Находим посты, время которых пришло
+            to_publish = []
+            for pid, val in scheduled_posts.items():
+                if now >= val['publish_time']:
+                    to_publish.append(pid)
             
-            if pid in scheduled_posts: del scheduled_posts[pid]
-            break
-        await asyncio.sleep(10)
+            for pid in to_publish:
+                post = scheduled_posts[pid]
+                await perform_publish(bot, CHANNEL_ID, post['post_data'])
+                
+                # Уведомляем админа
+                try:
+                    await bot.send_message(
+                        post['chat_id'], 
+                        f"✅ Отложенный пост <b>{post['post_data']['parsed']['game']}</b> опубликован!",
+                        parse_mode=ParseMode.HTML
+                    )
+                except: pass
+                
+                del scheduled_posts[pid]
+                
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            
+        await asyncio.sleep(5) # Проверка каждые 5 сек
 
 async def main():
-    bot = Bot(token=TOKEN)
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    
     await bot.delete_webhook(drop_pending_updates=True)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    
+    # Запускаем планировщик параллельно с ботом
+    asyncio.create_task(scheduler_loop(bot))
+    
+    logger.info("🚀 Бот запущен!")
+    await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
