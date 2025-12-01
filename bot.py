@@ -9,7 +9,7 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton
 )
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -27,9 +27,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- ХРАНИЛИЩЕ (В ПАМЯТИ) ---
-# Структура: { "post_id": { data: ..., time: ..., creator_id: 123, creator_name: "Alex" } }
 scheduled_posts: Dict[str, Dict[str, Any]] = {}
-# Для удаления сообщений-инструкций: { user_id: message_id }
 instruction_messages: Dict[int, int] = {}
 
 class Form(StatesGroup):
@@ -129,7 +127,6 @@ def kb_queue_control(pid: str, is_owner: bool, owner_name: str):
         buttons.append([InlineKeyboardButton(text="🚀 Выложить сейчас", callback_data=f"force_{pid}")])
         buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{pid}")])
     else:
-        # Если смотрит чужой админ, кнопки неактивны
         buttons.append([InlineKeyboardButton(text=f"👤 Автор: {owner_name}", callback_data="ignore")])
         buttons.append([InlineKeyboardButton(text="🔒 Только чтение", callback_data="ignore")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -152,6 +149,9 @@ async def start(msg: Message, state: FSMContext):
 async def new_post(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id): return
     
+    # Очищаем старые состояния
+    await state.clear()
+    
     example = (
         "Blox Fruits\n"
         "Крутой скрипт на автофарм\n"
@@ -159,7 +159,6 @@ async def new_post(msg: Message, state: FSMContext):
         "loadstring(game:HttpGet('...'))()"
     )
     
-    # Отправляем инструкцию и сохраняем ID, чтобы потом удалить
     info_msg = await msg.answer(
         "📝 <b>Создание нового поста</b>\n\n"
         "Отправь фото/видео с описанием или просто текст.\n"
@@ -172,7 +171,14 @@ async def new_post(msg: Message, state: FSMContext):
 
 @router.message(Form.waiting_content)
 async def process_content(msg: Message, state: FSMContext):
-    # 1. Удаляем сообщение с инструкцией (очистка чата)
+    # ПРОВЕРКА: Если нажата кнопка меню, выходим из состояния
+    if msg.text == "👤 Профиль":
+        await state.clear()
+        return await profile(msg)
+    if msg.text == "➕ Новый пост":
+        return await new_post(msg, state)
+
+    # 1. Удаляем сообщение с инструкцией
     if msg.chat.id in instruction_messages:
         try:
             await msg.bot.delete_message(msg.chat.id, instruction_messages[msg.chat.id])
@@ -206,9 +212,24 @@ async def process_content(msg: Message, state: FSMContext):
     except Exception as e:
         await msg.answer(f"❌ Ошибка: {e}")
 
+@router.callback_query(F.data == "cancel")
+async def cancel_post(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.delete()
+    await cb.answer("❌ Создание поста отменено")
+
+@router.callback_query(F.data == "ignore")
+async def ignore_click(cb: CallbackQuery):
+    await cb.answer("🔒 Это информационная кнопка / Нет прав", show_alert=True)
+
 @router.callback_query(F.data == "pub_now")
 async def pub_now(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    # Проверка на то, есть ли данные
+    if not data:
+        await cb.message.delete()
+        return await cb.answer("❌ Данные устарели, начни заново", show_alert=True)
+
     await publish_post(cb.bot, data)
     await state.clear()
     await cb.message.delete()
@@ -230,10 +251,21 @@ async def schedule_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(Form.waiting_time)
 async def schedule_finish(msg: Message, state: FSMContext):
+    # ПРОВЕРКА: Если нажата кнопка меню
+    if msg.text == "👤 Профиль":
+        await state.clear()
+        return await profile(msg)
+    if msg.text == "➕ Новый пост":
+        return await new_post(msg, state)
+
     t = parse_time(msg.text)
     if not t: return await msg.answer("⚠️ Не понял время. Попробуй: `1ч` или `15:00`")
     
     data = await state.get_data()
+    if not data:
+        await state.clear()
+        return await msg.answer("❌ Ошибка данных. Попробуй создать пост заново.")
+
     pid = f"{msg.from_user.id}_{int(datetime.now().timestamp())}"
     
     scheduled_posts[pid] = {
@@ -254,7 +286,6 @@ async def profile(msg: Message):
     if not is_admin(msg.from_user.id): return
     
     uid = msg.from_user.id
-    # Считаем посты
     my_posts = sum(1 for p in scheduled_posts.values() if p['creator_id'] == uid)
     total_posts = len(scheduled_posts)
     
@@ -308,7 +339,6 @@ async def queue_action(cb: CallbackQuery):
         await cb.message.delete()
         return await cb.answer("❌ Пост уже не существует", show_alert=True)
         
-    # Проверка прав (на всякий случай, хотя кнопки скрыты)
     if post['creator_id'] != cb.from_user.id:
         return await cb.answer("⛔ Это не твой пост!", show_alert=True)
         
