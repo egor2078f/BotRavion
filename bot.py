@@ -2,6 +2,7 @@ import logging
 import asyncio
 import re
 import uuid
+import os
 import aiosqlite
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -9,32 +10,38 @@ from typing import Dict, Any, Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+    ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 )
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
-CHANNEL_ID = "@RavionScripts" # ID канала (или @username)
-CHANNEL_URL = "https://t.me/RavionScripts" # Ссылка для кнопки подписки
-BOT_USERNAME = "RavionAdministrator_bot" # УКАЖИ ЮЗЕРНЕЙМ СВОЕГО БОТА (без @) ДЛЯ ГЕНЕРАЦИИ ССЫЛОК
+CHANNEL_ID = "@RavionScripts"  # Бот ДОЛЖЕН быть админом здесь
+CHANNEL_URL = "https://t.me/RavionScripts"
+BOT_USERNAME = "RavionAdministrator_bot" # Юзернейм бота без @
 WATERMARK = "https://t.me/RavionScripts"
+ADMINS = {7637946765, 6510703948}
 
-# ID админов (Int)
-ADMINS = {7637946765, 6510703948} 
+DB_NAME = "scripts_data.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- БАЗА ДАННЫХ (SQLite) ---
-DB_NAME = "scripts.db"
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+scheduled_posts: Dict[str, Dict[str, Any]] = {}
+instruction_messages: Dict[int, int] = {}
 
+class Form(StatesGroup):
+    waiting_content = State()
+    waiting_time = State()
+
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -42,66 +49,54 @@ async def init_db():
                 id TEXT PRIMARY KEY,
                 game_name TEXT,
                 code TEXT,
-                views INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                is_key BOOLEAN,
+                created_at TIMESTAMP,
+                views INTEGER DEFAULT 0
             )
         """)
         await db.commit()
 
-async def add_script_to_db(game_name: str, code: str) -> str:
-    # Генерируем короткий уникальный ID (8 символов)
-    script_id = uuid.uuid4().hex[:8]
+async def add_script_to_db(game_name: str, code: str, is_key: bool) -> str:
+    unique_id = str(uuid.uuid4())[:8] # Генерируем короткий ID
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO scripts (id, game_name, code) VALUES (?, ?, ?)", 
-                         (script_id, game_name, code))
+        await db.execute(
+            "INSERT INTO scripts (id, game_name, code, is_key, created_at) VALUES (?, ?, ?, ?, ?)",
+            (unique_id, game_name, code, is_key, datetime.now())
+        )
         await db.commit()
-    return script_id
+    return unique_id
 
 async def get_script_from_db(script_id: str):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT game_name, code, views FROM scripts WHERE id = ?", (script_id,)) as cursor:
+        async with db.execute("SELECT game_name, code, is_key, views FROM scripts WHERE id = ?", (script_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                # Увеличиваем счетчик просмотров
+                # Обновляем просмотры
                 await db.execute("UPDATE scripts SET views = views + 1 WHERE id = ?", (script_id,))
                 await db.commit()
-                return {'game': row[0], 'code': row[1], 'views': row[2]}
+                return {'game': row[0], 'code': row[1], 'key': row[2], 'views': row[3]}
     return None
 
 async def get_db_stats():
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT COUNT(*), SUM(views) FROM scripts") as cursor:
-            row = await cursor.fetchone()
-            return {'count': row[0] or 0, 'total_views': row[1] or 0}
-
-# --- ХРАНИЛИЩЕ (В ПАМЯТИ) ---
-scheduled_posts: Dict[str, Dict[str, Any]] = {}
-
-class Form(StatesGroup):
-    waiting_content = State()
-    waiting_time = State()
+            return await cursor.fetchone()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
-def html_escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 async def check_subscription(bot: Bot, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # Статусы, которые считаются "подписанными"
-        return member.status in [
-            ChatMemberStatus.CREATOR,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.RESTRICTED 
-        ]
+        return member.status in ['creator', 'administrator', 'member']
     except Exception as e:
         logger.error(f"Ошибка проверки подписки: {e}")
-        return False
+        return False # Если ошибка (например, бот не админ), считаем что не подписан
+
+def html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def parse_content(raw_text: str) -> Dict[str, Any]:
     lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
@@ -135,7 +130,8 @@ def parse_content(raw_text: str) -> Dict[str, Any]:
     res['desc'] = '\n'.join(desc_lines)
     return res
 
-def build_post_text(data: Dict, for_channel: bool = False) -> str:
+# Формирование текста для КАНАЛА (без кода, с кнопкой)
+def build_channel_post_text(data: Dict) -> str:
     game = html_escape(data['parsed']['game']).upper()
     desc = html_escape(data['parsed']['desc'])
     
@@ -145,16 +141,10 @@ def build_post_text(data: Dict, for_channel: bool = False) -> str:
         quoted_desc = "\n".join(f"💬 {line}" for line in desc.split('\n'))
         text += f"<blockquote>{quoted_desc}</blockquote>\n\n"
         
-    text += "🔐 <b>Требуется ключ</b>\n\n" if data['parsed']['key'] else "🔓 <b>Ключ не нужен</b>\n\n"
-    
-    # В канал код не пишем, пишем только в предпросмотре для админа
-    if not for_channel and data['parsed']['code']:
-        text += f"⚡ <b>СКРИПТ (ВИДЕН ТОЛЬКО АДМИНУ):</b>\n<pre><code class=\"language-lua\">...код скрыт...</code></pre>\n\n"
-    
-    if for_channel:
-         text += "⬇️ <b>Нажми на кнопку ниже, чтобы получить скрипт!</b>\n\n"
-
-    text += f"<b>━━━━━━━━━━━━━━━━━━━</b>\n📢 {CHANNEL_ID}"
+    text += "🔐 <b>Требуется ключ</b>\n" if data['parsed']['key'] else "🔓 <b>Ключ не нужен</b>\n"
+    text += "\n👇 <b>Нажми кнопку ниже, чтобы получить скрипт</b>"
+        
+    text += f"\n\n<b>━━━━━━━━━━━━━━━━━━━</b>\n📢 {CHANNEL_ID}"
     return text
 
 def parse_time(s: str) -> Optional[datetime]:
@@ -166,7 +156,6 @@ def parse_time(s: str) -> Optional[datetime]:
             if m := re.search(r'(\d+)\s*[чh]', s): delta += int(m.group(1)) * 60
             if m := re.search(r'(\d+)\s*[мm]', s): delta += int(m.group(1))
             return now + timedelta(minutes=delta) if delta > 0 else None
-        
         if re.match(r'^\d{1,2}:\d{2}$', s):
             h, m = map(int, s.split(':'))
             t = now.replace(hour=h, minute=m, second=0)
@@ -176,7 +165,7 @@ def parse_time(s: str) -> Optional[datetime]:
 
 # --- КЛАВИАТУРЫ ---
 
-def kb_main_admin():
+def kb_admin_main():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новый пост")],
         [KeyboardButton(text="👤 Профиль Админа")]
@@ -189,92 +178,112 @@ def kb_preview():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
-def kb_sub_check(script_id: str):
+def kb_queue_control(pid: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Выложить сейчас", callback_data=f"force_{pid}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{pid}")]
+    ])
+
+def kb_get_script(script_id: str):
+    # Эта кнопка будет в канале
+    url = f"https://t.me/{BOT_USERNAME}?start={script_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 ПОЛУЧИТЬ СКРИПТ 📜", url=url)]
+    ])
+
+def kb_force_sub(script_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_URL)],
-        [InlineKeyboardButton(text="🔄 Я подписался", callback_data=f"checksub_{script_id}")]
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data=f"check_sub:{script_id}")]
     ])
 
 # --- ЛОГИКА ---
 
 router = Router()
 
+# 1. ОБРАБОТКА СТАРТА (ГЛАВНАЯ ЛОГИКА)
 @router.message(CommandStart())
-async def cmd_start(msg: Message, command: CommandObject, state: FSMContext):
-    user_id = msg.from_user.id
+async def start_handler(msg: Message, command: CommandObject, state: FSMContext, bot: Bot):
     args = command.args
-
-    # 1. Логика Deep Linking (получение скрипта)
+    user_id = msg.from_user.id
+    
+    # СЦЕНАРИЙ 1: Пользователь перешел за скриптом
     if args:
-        # Аргумент должен быть ID скрипта
         script_id = args
-        
-        # Проверка подписки
-        is_sub = await check_subscription(msg.bot, user_id)
-        if not is_sub:
-            await msg.answer(
-                "⛔ <b>Доступ закрыт!</b>\n\n"
-                "Чтобы получить скрипт, вы должны быть подписаны на наш канал.",
-                reply_markup=kb_sub_check(script_id),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        # Если подписан, выдаем скрипт
         script_data = await get_script_from_db(script_id)
-        if script_data:
-            code_text = "\n".join([script_data['code']]) # Если там массив строк, объединить
-            await msg.answer(
-                f"✅ <b>Скрипт для {script_data['game']}</b>\n"
-                f"👀 Просмотров: {script_data['views']}\n\n"
-                f"<pre><code class=\"language-lua\">{html_escape(code_text)}</code></pre>",
+        
+        if not script_data:
+            return await msg.answer("❌ Скрипт не найден или был удален.")
+            
+        # Проверка подписки
+        is_sub = await check_subscription(bot, user_id)
+        
+        if not is_sub:
+            return await msg.answer(
+                "🔒 <b>Доступ закрыт!</b>\n\n"
+                f"Чтобы получить скрипт для <b>{script_data['game']}</b>, подпишись на наш канал.",
+                reply_markup=kb_force_sub(script_id),
                 parse_mode=ParseMode.HTML
             )
-        else:
-            await msg.answer("❌ Скрипт не найден. Возможно, он был удален.")
+            
+        # Если подписан - выдаем скрипт
+        await send_script_to_user(msg, script_data)
         return
 
-    # 2. Логика для Админов (без аргументов)
+    # СЦЕНАРИЙ 2: Админ зашел в панель
     if is_admin(user_id):
         await state.clear()
         await msg.answer(
             f"👋 Привет, Админ <b>{msg.from_user.first_name}</b>!\n"
             "Панель управления активирована.",
-            reply_markup=kb_main_admin(), parse_mode=ParseMode.HTML
+            reply_markup=kb_admin_main(), parse_mode=ParseMode.HTML
         )
         return
 
-    # 3. Логика для Обычных пользователей (без аргументов)
-    await msg.answer(
-        f"👋 Привет, <b>{msg.from_user.first_name}</b>!\n"
-        f"Я бот для выдачи скриптов с канала {CHANNEL_ID}.\n"
-        "Следи за новостями, нажимай на кнопки под постами и получай скрипты здесь!",
-        parse_mode=ParseMode.HTML
-    )
+    # СЦЕНАРИЙ 3: Обычный пользователь просто нажал старт (без ссылки)
+    await msg.answer("👋 Привет! Я выдаю скрипты с канала @RavionScripts.\nНайди нужный пост в канале и нажми кнопку.")
 
-@router.callback_query(F.data.startswith("checksub_"))
-async def callback_check_sub(cb: CallbackQuery):
-    script_id = cb.data.split("_")[1]
-    is_sub = await check_subscription(cb.bot, cb.from_user.id)
+# 2. callback проверки подписки
+@router.callback_query(F.data.startswith("check_sub:"))
+async def check_sub_callback(cb: CallbackQuery, bot: Bot):
+    script_id = cb.data.split(":")[1]
+    is_sub = await check_subscription(bot, cb.from_user.id)
     
     if is_sub:
-        await cb.message.delete()
+        await cb.message.delete() # Удаляем сообщение о подписке
         script_data = await get_script_from_db(script_id)
         if script_data:
-            code_text = script_data['code']
-            await cb.message.answer(
-                f"✅ <b>Спасибо за подписку!</b>\n\n"
-                f"🎮 Игра: <b>{script_data['game']}</b>\n"
-                f"👇 Твой скрипт:\n"
-                f"<pre><code class=\"language-lua\">{html_escape(code_text)}</code></pre>",
-                parse_mode=ParseMode.HTML
-            )
+            # Отправляем скрипт в ЛС (так как это callback, используем bot.send_message или cb.message.answer)
+            # Лучше создать новое сообщение
+            await send_script_to_user(cb.message, script_data)
         else:
-            await cb.message.answer("❌ Скрипт не найден в базе.")
+            await cb.answer("❌ Скрипт не найден", show_alert=True)
     else:
         await cb.answer("❌ Вы все еще не подписаны!", show_alert=True)
 
-# --- АДМИНКА ---
+async def send_script_to_user(msg_obj: Message, data: dict):
+    code = data['code']
+    game = data['game']
+    
+    header = f"🎮 <b>{game}</b>\n"
+    if data['key']: header += "🔐 <b>Требуется ключ!</b>\n"
+    
+    # Отправляем как файл, чтобы удобно копировать
+    file_data = code.encode('utf-8')
+    input_file = BufferedInputFile(file_data, filename=f"{game}_script.lua")
+    
+    await msg_obj.answer_document(
+        input_file,
+        caption=f"{header}\n✅ <b>Скрипт готов!</b>\nСпасибо за подписку!",
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Также можно отправить текстом для быстрого копирования (опционально)
+    if len(code) < 3500:
+         await msg_obj.answer(f"⚡ <b>Raw Script:</b>\n<pre><code class=\"language-lua\">{html_escape(code)}</code></pre>", parse_mode=ParseMode.HTML)
+
+
+# --- АДМИН ПАНЕЛЬ ---
 
 @router.message(F.text == "➕ Новый пост")
 async def new_post(msg: Message, state: FSMContext):
@@ -288,13 +297,15 @@ async def new_post(msg: Message, state: FSMContext):
         "loadstring(game:HttpGet('...'))()"
     )
     
-    await msg.answer(
-        "📝 <b>Создание нового поста</b>\n"
-        "Отправь фото/видео с описанием.\n"
-        "Скрипт будет автоматически вырезан и сохранен в БД.\n\n"
-        f"Пример:\n<code>{example}</code>",
+    info_msg = await msg.answer(
+        "📝 <b>Создание поста</b>\n\n"
+        "1. Первая строка - Имя игры\n"
+        "2. Дальше описание\n"
+        "3. Вставьте сам код (он будет скрыт и сохранен в БД)\n\n"
+        f"<code>{example}</code>",
         parse_mode=ParseMode.HTML
     )
+    instruction_messages[msg.chat.id] = info_msg.message_id
     await state.set_state(Form.waiting_content)
 
 @router.message(Form.waiting_content)
@@ -302,12 +313,18 @@ async def process_content(msg: Message, state: FSMContext):
     if msg.text == "👤 Профиль Админа": return await profile(msg)
     if msg.text == "➕ Новый пост": return await new_post(msg, state)
 
+    # Чистка инструкции
+    if msg.chat.id in instruction_messages:
+        try: await msg.bot.delete_message(msg.chat.id, instruction_messages[msg.chat.id])
+        except: pass
+
     ctype = 'text'
     fid = None
     text = msg.text or msg.caption or ""
     
     if msg.photo: ctype, fid = 'photo', msg.photo[-1].file_id
     elif msg.video: ctype, fid = 'video', msg.video.file_id
+    elif msg.animation: ctype, fid = 'animation', msg.animation.file_id
     
     if not text.strip() and ctype == 'text':
         return await msg.answer("⚠️ Пустое сообщение.")
@@ -315,7 +332,7 @@ async def process_content(msg: Message, state: FSMContext):
     parsed = parse_content(text)
     
     if not parsed['code']:
-        return await msg.answer("⚠️ Я не нашел код скрипта в сообщении! Добавь loadstring или ```lua ... ```.")
+        return await msg.answer("⚠️ <b>Ошибка:</b> Я не нашел код скрипта в сообщении! Добавь loadstring или код.", parse_mode=ParseMode.HTML)
 
     await state.update_data(
         ctype=ctype, 
@@ -324,19 +341,15 @@ async def process_content(msg: Message, state: FSMContext):
         creator_id=msg.from_user.id
     )
     
-    # Предпросмотр (показывает как будет в канале, но без рабочей кнопки пока)
-    preview_text = build_post_text(await state.get_data(), for_channel=True)
+    # Предпросмотр того, как это будет в канале
+    preview_text = build_channel_post_text(await state.get_data()) + "\n\n<i>(Админ превью)</i>"
     
     try:
         kwargs = {"caption": preview_text, "parse_mode": ParseMode.HTML, "reply_markup": kb_preview()}
         if ctype == 'photo': await msg.answer_photo(fid, **kwargs)
         elif ctype == 'video': await msg.answer_video(fid, **kwargs)
+        elif ctype == 'animation': await msg.answer_animation(fid, **kwargs)
         else: await msg.answer(preview_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb_preview())
-        
-        # Показываем админу код отдельно, чтобы он проверил, что бот поймал
-        code_view = "\n".join(parsed['code'])
-        await msg.answer(f"⚙️ <b>Скрипт, который будет сохранен в БД:</b>\n<pre>{html_escape(code_view)}</pre>", parse_mode=ParseMode.HTML)
-        
     except Exception as e:
         await msg.answer(f"❌ Ошибка: {e}")
 
@@ -345,25 +358,23 @@ async def pub_now(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if not data: return await cb.answer("❌ Данные устарели", show_alert=True)
 
-    # 1. Сохраняем скрипт в БД и получаем ID
-    full_code = "\n".join(data['parsed']['code'])
-    script_id = await add_script_to_db(data['parsed']['game'], full_code)
+    # 1. Сохраняем скрипт в БД
+    code_text = "\n".join(data['parsed']['code'])
+    script_id = await add_script_to_db(data['parsed']['game'], code_text, data['parsed']['key'])
     
-    # 2. Обновляем данные, добавляя ID скрипта
+    # 2. Добавляем ID скрипта в данные для публикации
     data['script_id'] = script_id
     
-    # 3. Публикуем
     asyncio.create_task(publish_post(cb.bot, data)) 
-    
     await state.clear()
     await cb.message.delete()
-    await cb.answer("✅ Отправлено!")
+    await cb.answer("✅ Пост опубликован!")
 
 @router.callback_query(F.data == "schedule")
 async def schedule_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_time)
     await cb.message.delete()
-    await cb.message.answer("⏰ Введите время (например: 1ч, 18:00):")
+    await cb.message.answer("⏰ Введите время (например: <code>1ч</code> или <code>15:30</code>):", parse_mode=ParseMode.HTML)
 
 @router.message(Form.waiting_time)
 async def schedule_finish(msg: Message, state: FSMContext):
@@ -372,87 +383,101 @@ async def schedule_finish(msg: Message, state: FSMContext):
     
     data = await state.get_data()
     
-    # Сначала сохраняем в БД, чтобы получить ID
-    full_code = "\n".join(data['parsed']['code'])
-    script_id = await add_script_to_db(data['parsed']['game'], full_code)
+    # Сразу сохраняем в БД, чтобы получить ID ссылки
+    code_text = "\n".join(data['parsed']['code'])
+    script_id = await add_script_to_db(data['parsed']['game'], code_text, data['parsed']['key'])
     data['script_id'] = script_id
 
     pid = f"{data['creator_id']}_{int(datetime.now().timestamp())}"
-    
-    scheduled_posts[pid] = {
-        'data': data,
-        'time': t,
-        'creator_id': data['creator_id']
-    }
+    scheduled_posts[pid] = {'data': data, 'time': t, 'creator_id': msg.from_user.id}
     
     await state.clear()
-    await msg.answer(f"✅ Пост с ID скрипта <code>{script_id}</code> запланирован на {t.strftime('%H:%M')}", parse_mode=ParseMode.HTML, reply_markup=kb_main_admin())
+    await msg.answer(f"✅ Запланировано на {t.strftime('%H:%M')}", reply_markup=kb_admin_main())
 
 @router.message(F.text == "👤 Профиль Админа")
 async def profile(msg: Message):
     if not is_admin(msg.from_user.id): return
     
-    stats = await get_db_stats()
+    count, views = await get_db_stats()
+    queue_len = len(scheduled_posts)
     
     text = (
-        f"👨‍💻 <b>Админ Панель</b>\n"
-        f"👤 {msg.from_user.first_name}\n\n"
-        f"📊 <b>Статистика БД:</b>\n"
-        f"📂 Скриптов в базе: <b>{stats['count']}</b>\n"
-        f"👀 Всего выдач (просмотров): <b>{stats['total_views']}</b>\n"
-        f"⏳ Запланировано постов: {len(scheduled_posts)}"
+        f"👨‍💻 <b>Панель Администратора</b>\n"
+        f"💾 Скриптов в базе: <b>{count}</b>\n"
+        f"👁 Всего получений: <b>{views if views else 0}</b>\n"
+        f"⏳ Постов в очереди: <b>{queue_len}</b>"
     )
     
-    await msg.answer(text, parse_mode=ParseMode.HTML)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📂 Очередь публикаций", callback_data="view_queue")]])
+    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@router.callback_query(F.data == "view_queue")
+async def view_queue(cb: CallbackQuery):
+    if not scheduled_posts: return await cb.answer("📭 Очередь пуста", show_alert=True)
+    for pid, post in sorted(scheduled_posts.items(), key=lambda x: x[1]['time']):
+        await cb.message.answer(
+            f"⏰ {post['time'].strftime('%d.%m %H:%M')} | {post['data']['parsed']['game']}",
+            reply_markup=kb_queue_control(pid)
+        )
+    await cb.answer()
+
+@router.callback_query(F.data == "cancel")
+async def cancel_action(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.delete()
+
+@router.callback_query(F.data.startswith("force_") | F.data.startswith("del_"))
+async def queue_action(cb: CallbackQuery):
+    action, pid = cb.data.split("_", 1)
+    if pid in scheduled_posts:
+        if action == "del":
+            del scheduled_posts[pid]
+            await cb.answer("🗑 Удалено")
+        elif action == "force":
+            scheduled_posts[pid]['time'] = datetime.now() - timedelta(seconds=1)
+            await cb.answer("🚀 Запуск...")
+        await cb.message.delete()
+    else:
+        await cb.answer("Ошибка: пост не найден", show_alert=True)
 
 # --- ПУБЛИКАЦИЯ ---
 
 async def publish_post(bot: Bot, data: Dict):
-    text = build_post_text(data, for_channel=True)
+    text = build_channel_post_text(data)
     ctype, fid = data['ctype'], data['fid']
-    script_id = data.get('script_id')
+    script_id = data['script_id']
     
-    # Генерируем ссылку на бот с ID скрипта
-    # Формат: https://t.me/BotUsername?start=script_id
-    bot_link = f"https://t.me/{BOT_USERNAME}?start={script_id}"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 ПОЛУЧИТЬ СКРИПТ", url=bot_link)]
-    ])
+    # ГЛАВНОЕ: Кнопка ведет в бота
+    kb = kb_get_script(script_id)
     
     try:
         if ctype == 'photo': await bot.send_photo(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         elif ctype == 'video': await bot.send_video(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif ctype == 'animation': await bot.send_animation(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         else: await bot.send_message(CHANNEL_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
         
-        await bot.send_message(data['creator_id'], f"✅ Пост опубликован! ID скрипта: <code>{script_id}</code>", parse_mode=ParseMode.HTML)
+        await bot.send_message(data['creator_id'], f"✅ Пост <b>{data['parsed']['game']}</b> опубликован!", parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
 async def scheduler(bot: Bot):
     while True:
         now = datetime.now()
-        posts_to_publish = []
+        to_pub = []
         for pid in list(scheduled_posts.keys()):
-            post = scheduled_posts[pid]
-            if now >= post['time']:
-                posts_to_publish.append((pid, post['data']))
+            if now >= scheduled_posts[pid]['time']:
+                to_pub.append(scheduled_posts[pid]['data'])
                 del scheduled_posts[pid]
         
-        if posts_to_publish:
-            tasks = [publish_post(bot, data) for pid, data in posts_to_publish]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
+        if to_pub:
+            await asyncio.gather(*[publish_post(bot, d) for d in to_pub])
         await asyncio.sleep(5)
 
 async def main():
-    # Инициализация БД
-    await init_db()
-    
+    await init_db() # Инициализация БД при старте
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.gather(dp.start_polling(bot), scheduler(bot))
 
