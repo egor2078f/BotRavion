@@ -78,11 +78,14 @@ def build_post_text(data: Dict) -> str:
     game = html_escape(data['game']).upper()
     desc = html_escape(data['desc'])
     
+    # СТРУКТУРА ПОСТА
     text = f"<b>━━━━━━━━━━━━━━━━━━━</b>\n🎮 <b>{game}</b>\n<b>━━━━━━━━━━━━━━━━━━━</b>\n\n"
     
-    # ИСПОЛЬЗУЕМ ЦИТИРОВАНИЕ ДЛЯ ОПИСАНИЯ
+    # ИСПОЛЬЗУЕМ ЦИТИРОВАНИЕ ТОЛЬКО ДЛЯ ОПИСАНИЯ
     if desc: 
-        text += f"<blockquote>💬 {desc}</blockquote>\n\n"
+        # Добавляем иконку и цитируем только текст описания
+        quoted_desc = "\n".join(f"💬 {line}" for line in desc.split('\n'))
+        text += f"<blockquote>{quoted_desc}</blockquote>\n\n"
         
     text += "🔐 <b>Требуется ключ</b>\n\n" if data['key'] else "🔓 <b>Ключ не нужен</b>\n\n"
     
@@ -330,7 +333,6 @@ async def view_queue(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("force_") | F.data.startswith("del_"))
 async def queue_action(cb: CallbackQuery):
-    # Исправлена ошибка разделения, чтобы кнопки работали
     action, pid = cb.data.split("_", 1) 
     
     post = scheduled_posts.get(pid)
@@ -368,7 +370,6 @@ async def publish_post(bot: Bot, data: Dict):
 async def scheduler(bot: Bot):
     while True:
         now = datetime.now()
-        # ОПТИМИЗАЦИЯ: Итерируемся по ключам, чтобы безопасно удалять элементы
         for pid in list(scheduled_posts.keys()):
             post = scheduled_posts[pid]
             if now >= post['time']:
