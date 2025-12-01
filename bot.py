@@ -1,10 +1,8 @@
 import logging
 import asyncio
 import re
-import json
-import aiosqlite
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Union, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
@@ -22,65 +20,23 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
 CHANNEL_ID = "@RavionScripts"
-# Ссылка на твой скрипт-лоадер или канал
-WATERMARK_URL = "https://t.me/RavionScripts" 
-ADMINS = {7637946765, 6510703948}
-DB_NAME = "posts.db"
+WATERMARK = "https://t.me/RavionScripts"
+# ID всех админов через запятую
+ADMINS = {7637946765, 6510703948} 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+# --- ХРАНИЛИЩЕ (В ПАМЯТИ) ---
+scheduled_posts: Dict[str, Dict[str, Any]] = {}
 instruction_messages: Dict[int, int] = {}
 
 class Form(StatesGroup):
     waiting_content = State()
     waiting_time = State()
 
-# --- БАЗА ДАННЫХ ---
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
-                pid TEXT PRIMARY KEY,
-                creator_id INTEGER,
-                creator_name TEXT,
-                parsed_json TEXT,
-                time_timestamp REAL
-            )
-        """)
-        await db.commit()
-
-async def add_post_to_db(pid: str, data: Dict, publish_time: datetime):
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Сериализуем данные (data) в JSON строку
-        json_data = json.dumps(data, ensure_ascii=False)
-        await db.execute(
-            "INSERT INTO posts (pid, creator_id, creator_name, parsed_json, time_timestamp) VALUES (?, ?, ?, ?, ?)",
-            (pid, data['creator_id'], data['creator_name'], json_data, publish_time.timestamp())
-        )
-        await db.commit()
-
-async def get_all_posts():
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT pid, creator_id, creator_name, parsed_json, time_timestamp FROM posts") as cursor:
-            rows = await cursor.fetchall()
-            posts = {}
-            for row in rows:
-                posts[row[0]] = {
-                    'creator_id': row[1],
-                    'creator_name': row[2],
-                    'data': json.loads(row[3]),
-                    'time': datetime.fromtimestamp(row[4])
-                }
-            return posts
-
-async def delete_post_from_db(pid: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM posts WHERE pid = ?", (pid,))
-        await db.commit()
-
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# ... (parse_content, parse_time, kb_main, kb_preview, kb_queue_control - без изменений) ...
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
@@ -98,31 +54,19 @@ def parse_content(raw_text: str) -> Dict[str, Any]:
     code_found = False
     desc_lines = []
     
-    # Регулярка для поиска loadstring(game:HttpGet(...))
-    # Поддерживает любые кавычки и пробелы
-    loadstring_pattern = re.compile(r'loadstring\s*\(\s*game:HttpGet\s*\(\s*[\'"](.*?)[\'"]\s*\)\s*\)\s*\(\s*\)', re.IGNORECASE)
-
     for line in lines[1:]:
         low = line.lower()
         if '#key' in low or 'key+' in low: res['key'] = True; continue
         if '#nokey' in low or 'key-' in low or 'no key' in low: res['key'] = False; continue
             
-        # Определение начала кода
         is_code = any(x in low for x in ['loadstring', 'game:', 'function', 'local ', 'getgenv', '```'])
         
         if not code_found and is_code:
             code_found = True
-            clean = line.replace('```lua', '').replace('```', '').strip()
-            
-            # Внедрение водяного знака
-            if 'game:httpget' in clean.lower():
-                # Если нашли loadstring, заменяем ссылку внутри на нашу
-                if loadstring_pattern.search(clean):
-                    clean = loadstring_pattern.sub(f'loadstring(game:HttpGet("{WATERMARK_URL}"))()', clean)
-                elif WATERMARK_URL not in clean:
-                     # Если паттерн сложный, просто добавляем комментарий
-                     clean = f"-- Source: {WATERMARK_URL}\n" + clean
-            
+            clean = line.replace('```lua', '').replace('```', '')
+            if 'game:HttpGet' in clean and WATERMARK not in clean:
+                if clean.endswith('()'): clean = clean[:-2] + f'("{WATERMARK}")'
+                elif clean.endswith('();'): clean = clean[:-3] + f'("{WATERMARK}");'
             res['code'].append(clean)
         elif code_found:
             res['code'].append(line.replace('```', ''))
@@ -171,7 +115,6 @@ def parse_time(s: str) -> Optional[datetime]:
     except: pass
     return None
 
-# --- КЛАВИАТУРЫ ---
 def kb_main():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новый пост")],
@@ -258,7 +201,7 @@ async def process_content(msg: Message, state: FSMContext):
         return await msg.answer("⚠️ Пустое сообщение. Попробуй снова.")
         
     parsed = parse_content(text)
-    
+    # Сохраняем только те данные, которые нужны для публикации
     await state.update_data(
         ctype=ctype, 
         fid=fid, 
@@ -267,7 +210,7 @@ async def process_content(msg: Message, state: FSMContext):
         creator_name=msg.from_user.first_name
     )
     
-    preview = build_post_text(await state.get_data())
+    preview = build_post_text(await state.get_data()) # Используем data из FSM
     
     try:
         kwargs = {"caption": preview, "parse_mode": ParseMode.HTML, "reply_markup": kb_preview()}
@@ -296,6 +239,7 @@ async def pub_now(cb: CallbackQuery, state: FSMContext):
         await cb.message.delete()
         return await cb.answer("❌ Данные устарели", show_alert=True)
 
+    # Используем asyncio.create_task для публикации, чтобы callback не ждал
     asyncio.create_task(publish_post(cb.bot, data)) 
     await state.clear()
     await cb.message.delete()
@@ -325,6 +269,7 @@ async def schedule_finish(msg: Message, state: FSMContext):
     t = parse_time(msg.text)
     if not t: return await msg.answer("⚠️ Не понял время.")
     
+    # Все нужные данные уже в state, просто забираем их
     data = await state.get_data()
     if not data:
         await state.clear()
@@ -332,8 +277,12 @@ async def schedule_finish(msg: Message, state: FSMContext):
 
     pid = f"{data['creator_id']}_{int(datetime.now().timestamp())}"
     
-    # СОХРАНЯЕМ В БД
-    await add_post_to_db(pid, data, t)
+    scheduled_posts[pid] = {
+        'data': data,
+        'time': t,
+        'creator_id': data['creator_id'],
+        'creator_name': data['creator_name']
+    }
     
     await state.clear()
     await msg.answer(
@@ -346,11 +295,8 @@ async def profile(msg: Message):
     if not is_admin(msg.from_user.id): return
     
     uid = msg.from_user.id
-    
-    # Читаем из БД для статистики
-    all_posts = await get_all_posts()
-    my_posts = sum(1 for p in all_posts.values() if p['creator_id'] == uid)
-    total = len(all_posts)
+    my_posts = sum(1 for p in scheduled_posts.values() if p['creator_id'] == uid)
+    total = len(scheduled_posts)
     
     text = (
         f"👨‍💻 <b>Профиль Администратора</b>\n"
@@ -366,13 +312,11 @@ async def profile(msg: Message):
 
 @router.callback_query(F.data == "view_queue")
 async def view_queue(cb: CallbackQuery):
-    all_posts = await get_all_posts()
-    
-    if not all_posts:
+    if not scheduled_posts:
         return await cb.answer("📭 Очередь пуста", show_alert=True)
     
     user_id = cb.from_user.id
-    sorted_posts = sorted(all_posts.items(), key=lambda x: x[1]['time'])
+    sorted_posts = sorted(scheduled_posts.items(), key=lambda x: x[1]['time'])
     
     await cb.message.answer("<b>📅 ОЧЕРЕДЬ ПУБЛИКАЦИЙ:</b>", parse_mode=ParseMode.HTML)
     
@@ -397,8 +341,7 @@ async def view_queue(cb: CallbackQuery):
 async def queue_action(cb: CallbackQuery):
     action, pid = cb.data.split("_", 1) 
     
-    all_posts = await get_all_posts()
-    post = all_posts.get(pid)
+    post = scheduled_posts.get(pid)
     
     if not post: 
         await cb.message.delete()
@@ -408,64 +351,65 @@ async def queue_action(cb: CallbackQuery):
         return await cb.answer("⛔ Это не твой пост!", show_alert=True)
         
     if action == "del":
-        await delete_post_from_db(pid)
+        del scheduled_posts[pid]
         await cb.message.delete()
         await cb.answer("🗑 Пост удален")
     elif action == "force":
-        # Удаляем из БД и публикуем
-        await delete_post_from_db(pid)
-        asyncio.create_task(publish_post(cb.bot, post['data']))
+        # Сразу запускаем публикацию как асинхронную задачу
+        scheduled_posts[pid]['time'] = datetime.now() - timedelta(seconds=1) 
         await cb.message.delete()
         await cb.answer("🚀 Отправляю в публикацию...")
 
 async def publish_post(bot: Bot, data: Dict):
     text = build_post_text(data)
     ctype, fid = data['ctype'], data['fid']
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Скрипт в канале", url=WATERMARK_URL)]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Скрипт в канале", url=WATERMARK)]])
     
     try:
+        # УЛУЧШЕНИЕ: Обработка ошибок Telegram API
         if ctype == 'photo': await bot.send_photo(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         elif ctype == 'video': await bot.send_video(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         elif ctype == 'animation': await bot.send_animation(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         elif ctype == 'document': await bot.send_document(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         else: await bot.send_message(CHANNEL_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
         
+        # Уведомляем создателя
         await bot.send_message(data['creator_id'], f"✅ Твой пост <b>{data['parsed']['game']}</b> опубликован!", parse_mode=ParseMode.HTML)
     
     except TelegramForbiddenError:
-        logger.error(f"Бот заблокирован пользователем {data['creator_id']}.")
+        logger.error(f"Бот не может отправить сообщение пользователю {data['creator_id']} (заблокирован или вышел).")
     except TelegramBadRequest as e:
-        logger.error(f"Ошибка API при публикации: {e}")
+        logger.error(f"Telegram API ошибка при публикации: {e}")
     except Exception as e:
-        logger.error(f"Неизвестная ошибка: {e}")
+        logger.error(f"Неизвестная ошибка публикации: {e}")
 
 async def scheduler(bot: Bot):
     while True:
-        try:
-            now = datetime.now()
-            all_posts = await get_all_posts() # Получаем актуальное состояние из БД
+        now = datetime.now()
+        # Итерируемся по ключам, чтобы безопасно удалять элементы
+        posts_to_publish = []
+        for pid in list(scheduled_posts.keys()):
+            post = scheduled_posts[pid]
+            if now >= post['time']:
+                posts_to_publish.append((pid, post['data']))
+                del scheduled_posts[pid] # Удаляем из очереди сразу
+        
+        # Запускаем все публикации параллельно с помощью gather
+        if posts_to_publish:
+            tasks = [publish_post(bot, data) for pid, data in posts_to_publish]
+            await asyncio.gather(*tasks, return_exceptions=True)
             
-            for pid, post in all_posts.items():
-                if now >= post['time']:
-                    # Сначала удаляем из БД, чтобы не отправить дважды при ошибке
-                    await delete_post_from_db(pid)
-                    # Публикуем
-                    asyncio.create_task(publish_post(bot, post['data']))
-            
-            await asyncio.sleep(10) # Проверка каждые 10 секунд
-        except Exception as e:
-            logger.error(f"Ошибка в планировщике: {e}")
-            await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
 async def main():
-    await init_db() # Инициализация БД при запуске
-    
+    # Запускаем Dispatcher и Scheduler параллельно
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     
     await bot.delete_webhook(drop_pending_updates=True)
     
+    # Запускаем обе задачи параллельно
     await asyncio.gather(
         dp.start_polling(bot),
         scheduler(bot)
@@ -474,6 +418,6 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен.")
+        logger.info("Бот остановлен вручную.")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        logger.error(f"Критическая ошибка при запуске: {e}")
