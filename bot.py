@@ -3,39 +3,29 @@ import re
 import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any
+import dateparser
 
 try:
     from aiogram import Bot, Dispatcher, F, Router
     from aiogram.types import (
-        Message, 
-        CallbackQuery, 
-        InlineKeyboardButton, 
-        InlineKeyboardMarkup,
-        ReplyKeyboardMarkup,
-        KeyboardButton,
-        ReplyKeyboardRemove
+        Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+        ReplyKeyboardMarkup, KeyboardButton, FSInputFile
     )
     from aiogram.filters import Command, CommandStart
     from aiogram.fsm.context import FSMContext
     from aiogram.fsm.state import State, StatesGroup
     from aiogram.fsm.storage.memory import MemoryStorage
 except ImportError:
-    print("CRITICAL ERROR: Библиотека 'aiogram' не установлена.")
-    print("Установите: pip install -r requirements.txt")
+    print("CRITICAL ERROR: Установите: pip install aiogram dateparser")
     exit(1)
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
 CHANNEL = "@RavionScripts"
 WATERMARK_URL = "https://t.me/RavionScripts"
-ADMIN_ID = 7637946765
-MODERATOR_ID = 6510703948
-ALLOWED_USERS = {ADMIN_ID, MODERATOR_ID}
+ALLOWED_USERS = {7637946765, 6510703948}
 
 user_data: Dict[int, Dict[str, Any]] = {}
 scheduled_posts: Dict[str, Dict[str, Any]] = {}
@@ -48,382 +38,306 @@ def process_script_logic(text: str) -> list:
     code_lines = []
     in_code_block = False
     
-    raw_lines = text.split('\n')
-    
-    for line in raw_lines:
+    for line in text.split('\n'):
         stripped = line.strip()
-        
         if stripped.startswith('```'):
             in_code_block = not in_code_block
             continue
-            
-        is_code_line = (
-            in_code_block or 
-            any(k in line.lower() for k in ['loadstring', 'game:', 'local', 'function', 'http', 'script', 'args'])
-        )
-
-        if is_code_line:
+        
+        is_code = in_code_block or any(k in line.lower() for k in ['loadstring', 'game:', 'local', 'function', 'http'])
+        
+        if is_code:
             if 'loadstring' in stripped and 'game:HttpGet' in stripped:
-                if stripped.endswith('()'):
-                    stripped = stripped[:-2] + f'("{WATERMARK_URL}")'
-                elif stripped.endswith('();'):
-                    stripped = stripped[:-3] + f'("{WATERMARK_URL}");'
-            
+                if stripped.endswith(('()', '();')):
+                    stripped = re.sub(r'\)(\(\))?;?$', f'("{WATERMARK_URL}")\\1', stripped)
             code_lines.append(stripped)
-            
+    
     return code_lines
 
 def parse_content(text: str) -> Dict[str, Any]:
-    lines = text.strip().split('\n')
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
     
-    result = {
-        'game': '',
-        'desc': '',
-        'key': False,
-        'code': []
-    }
+    result = {'game': '', 'desc': '', 'key': False, 'code': []}
     
     if not lines:
         return result
     
-    result['game'] = lines[0].strip()
+    result['game'] = lines[0]
     
-    code_start_idx = None
-    
-    for i, line in enumerate(lines[1:], start=1):
-        lower_line = line.lower().strip()
-        
-        if '#key' in lower_line or 'key+' in lower_line or '+key' in lower_line:
+    code_start = None
+    for i, line in enumerate(lines[1:], 1):
+        lower = line.lower()
+        if '#key' in lower or 'key+' in lower:
             result['key'] = True
-            continue
-        elif '#nokey' in lower_line or 'key-' in lower_line or '-key' in lower_line or 'no key' in lower_line:
+        elif '#nokey' in lower or 'key-' in lower or 'no key' in lower:
             result['key'] = False
-            continue
-        
-        if code_start_idx is None and any(k in lower_line for k in ['loadstring', 'game:', 'local ', 'function', '```']):
-            code_start_idx = i
+        elif code_start is None and any(k in lower for k in ['loadstring', 'game:', 'local ', 'function', '```']):
+            code_start = i
             break
     
-    if code_start_idx and code_start_idx > 1:
-        desc_lines = []
-        for i in range(1, code_start_idx):
-            line = lines[i].strip()
-            if line and not line.startswith('#') and 'key' not in line.lower():
-                desc_lines.append(line)
-        result['desc'] = ' '.join(desc_lines)
+    if code_start and code_start > 1:
+        result['desc'] = ' '.join([l for l in lines[1:code_start] if not l.startswith('#') and 'key' not in l.lower()])
     
-    if code_start_idx:
-        code_text = '\n'.join(lines[code_start_idx:])
-        result['code'] = process_script_logic(code_text)
+    if code_start:
+        result['code'] = process_script_logic('\n'.join(lines[code_start:]))
     
     return result
 
-def format_post(game_name: str, description: str, has_key: bool, code: list) -> str:
-    lines = []
+def format_post(game: str, desc: str, key: bool, code: list) -> str:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━",
+        f"🎮  {game.upper()}",
+        "━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
     
-    lines.append("━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🎮  {game_name.upper()}")
-    lines.append("━━━━━━━━━━━━━━━━━━━")
-    lines.append("")
+    if desc:
+        lines.extend([f"💬  {desc}", ""])
     
-    if description:
-        lines.append(f"💬  {description}")
-        lines.append("")
-    
-    key_emoji = "🔐" if has_key else "🔓"
-    key_text = "Требуется ключ" if has_key else "Ключ не нужен"
-    lines.append(f"{key_emoji}  {key_text}")
-    lines.append("")
+    lines.extend([
+        f"{'🔐' if key else '🔓'}  {'Требуется ключ' if key else 'Ключ не нужен'}",
+        ""
+    ])
     
     if code:
-        lines.append("⚡  СКРИПТ:")
-        lines.append("```lua")
-        lines.extend(code)
-        lines.append("```")
-        lines.append("")
+        lines.extend(["⚡  СКРИПТ:", "```lua"] + code + ["```", ""])
     
-    lines.append("━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📢  {CHANNEL}")
-    
+    lines.extend(["━━━━━━━━━━━━━━━━━━━", f"📢  {CHANNEL}"])
     return '\n'.join(lines)
 
-def get_channel_button() -> InlineKeyboardMarkup:
+def get_channel_btn() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📢 Перейти в канал", url='https://t.me/RavionScripts')
+        InlineKeyboardButton(text="📢 Канал", url='https://t.me/RavionScripts')
     ]])
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
+def get_main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новый пост")],
-        [KeyboardButton(text="📋 Мои посты"), KeyboardButton(text="📊 Статистика")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        [KeyboardButton(text="📋 Очередь"), KeyboardButton(text="📊 Статус")]
+    ], resize_keyboard=True)
 
-def get_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data='publish')],
+def get_action_kb(post_id: str = None) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="✅ Сейчас", callback_data='publish')],
         [InlineKeyboardButton(text="⏰ Отложить", callback_data='schedule')],
         [InlineKeyboardButton(text="✏️ Изменить", callback_data='edit')],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data='cancel')]
-    ])
+        [InlineKeyboardButton(text="❌ Отмена", callback_data='cancel')]
+    ]
+    
+    if post_id:
+        buttons.insert(1, [InlineKeyboardButton(text="🚀 Опубликовать немедленно", callback_data=f'pub_now_{post_id}')])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def parse_time(time_str: str) -> datetime | None:
     try:
         now = datetime.now()
         time_str = time_str.lower().strip()
         
-        time_match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
-        if time_match:
-            hour, minute = int(time_match.group(1)), int(time_match.group(2))
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            return target + timedelta(days=1) if target <= now else target
-        
-        if 'ч' in time_str or 'м' in time_str:
-            hours = 0
-            minutes = 0
-            
-            hours_match = re.search(r'(\d+)ч', time_str)
-            if hours_match:
-                hours = int(hours_match.group(1))
-            
-            mins_match = re.search(r'(\d+)м', time_str)
-            if mins_match:
-                minutes = int(mins_match.group(1))
-            
+        # 50м, 2ч, 1ч30м
+        if 'ч' in time_str or 'м' in time_str or 'h' in time_str or 'm' in time_str:
+            hours = minutes = 0
+            h_match = re.search(r'(\d+)[чh]', time_str)
+            m_match = re.search(r'(\d+)[мm]', time_str)
+            if h_match:
+                hours = int(h_match.group(1))
+            if m_match:
+                minutes = int(m_match.group(1))
             if hours or minutes:
                 return now + timedelta(hours=hours, minutes=minutes)
         
-        if 'завтра' in time_str:
-            time_match = re.search(r'(\d{1,2}):(\d{2})', time_str)
-            if time_match:
-                return (now + timedelta(days=1)).replace(
-                    hour=int(time_match.group(1)), 
-                    minute=int(time_match.group(2)), 
-                    second=0, 
-                    microsecond=0
-                )
+        # 14:30
+        time_match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+        if time_match:
+            h, m = int(time_match.group(1)), int(time_match.group(2))
+            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            return target + timedelta(days=1) if target <= now else target
+        
+        # 02.11.2025 11:40 или 02.11 11:40
+        dt_match = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})$', time_str)
+        if dt_match:
+            day, month = int(dt_match.group(1)), int(dt_match.group(2))
+            year = int(dt_match.group(3)) if dt_match.group(3) else now.year
+            hour, minute = int(dt_match.group(4)), int(dt_match.group(5))
+            target = datetime(year, month, day, hour, minute)
+            return target if target > now else None
+        
+        # Естественный язык (через 2 часа, завтра в 15:00, через 30 минут)
+        parsed = dateparser.parse(
+            time_str,
+            languages=['ru', 'en'],
+            settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': now}
+        )
+        if parsed and parsed > now:
+            return parsed
+        
     except Exception as e:
-        logger.error(f"Ошибка парсинга времени: {e}")
-        return None
+        logger.error(f"Ошибка парсинга: {e}")
     
     return None
-
-def check_access(user_id: int) -> bool:
-    return user_id in ALLOWED_USERS
 
 router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    if not check_access(user_id):
+    if message.from_user.id not in ALLOWED_USERS:
         return
     
-    user_data[user_id] = {
-        'game': '', 
-        'desc': '', 
-        'key': False, 
-        'code': [], 
-        'photo': None
-    }
-    
+    user_data[message.from_user.id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'media': None, 'media_type': None}
     await state.clear()
     
-    username = message.from_user.first_name or "Администратор"
-    
-    welcome_text = f"""━━━━━━━━━━━━━━━━━━━
-👋  Привет, {username}!
-━━━━━━━━━━━━━━━━━━━
-
-🤖  Я помогу создавать посты для канала
-
-📝  Формат сообщения:
-
-Название игры
-Описание (необязательно)
-#key или #nokey
-loadstring(game:HttpGet(...))()
-
-📸  Можно прикрепить фото
-⏰  Можно отложить публикацию
-
-━━━━━━━━━━━━━━━━━━━
-
-Нажми "➕ Новый пост" чтобы начать"""
-    
     await message.answer(
-        welcome_text,
-        reply_markup=get_main_keyboard(),
-        parse_mode='Markdown'
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        f"📝 Формат:\n"
+        f"Название игры\n"
+        f"Описание\n"
+        f"#key или #nokey\n"
+        f"loadstring(...)\n\n"
+        f"📸 Фото/видео — прикрепи\n"
+        f"⏰ Время — любой формат\n\n"
+        f"Примеры времени:\n"
+        f"50м | 2ч | 14:30 | 02.11.2025 11:40",
+        reply_markup=get_main_kb()
     )
 
 @router.message(F.text == "➕ Новый пост")
 async def new_post(message: Message, state: FSMContext):
-    if not check_access(message.from_user.id):
+    if message.from_user.id not in ALLOWED_USERS:
         return
-    
-    help_text = """━━━━━━━━━━━━━━━━━━━
-📝  СОЗДАНИЕ ПОСТА
-━━━━━━━━━━━━━━━━━━━
-
-Пример 1 (с ключом):
-
-Blox Fruits
-Лучший скрипт для фарма
-#key
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-Пример 2 (без ключа):
-
-Pet Simulator X
-#nokey
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-Пример 3 (минимальный):
-
-Arsenal
-loadstring(game:HttpGet("ссылка"))()
-
-━━━━━━━━━━━━━━━━━━━
-
-💡  Можешь прикрепить фото к сообщению
-❌  /cancel для отмены"""
     
     await state.set_state(PostStates.waiting_content)
-    await message.answer(help_text, parse_mode='Markdown')
+    await message.answer(
+        "📝 Отправь пост:\n\n"
+        "Пример:\n"
+        "Blox Fruits\n"
+        "Лучший скрипт\n"
+        "#key\n"
+        "loadstring(game:HttpGet(\"url\"))()\n\n"
+        "📸 Можно с фото/видео\n"
+        "❌ /cancel отмена"
+    )
 
-@router.message(F.text == "📋 Мои посты")
-async def my_posts(message: Message):
-    if not check_access(message.from_user.id):
+@router.message(F.text == "📋 Очередь")
+async def queue(message: Message):
+    if message.from_user.id not in ALLOWED_USERS:
+        return
+    await show_queue(message, message.from_user.id)
+
+@router.message(F.text == "📊 Статус")
+async def status(message: Message):
+    if message.from_user.id not in ALLOWED_USERS:
         return
     
-    await show_scheduled(message, message.from_user.id)
-
-@router.message(F.text == "📊 Статистика")
-async def stats(message: Message):
-    if not check_access(message.from_user.id):
-        return
-    
-    user_id = message.from_user.id
-    count = len([p for p in scheduled_posts.values() if p['user_id'] == user_id])
-    
-    stats_text = f"""━━━━━━━━━━━━━━━━━━━
-📊  СТАТИСТИКА
-━━━━━━━━━━━━━━━━━━━
-
-⏰  Постов в очереди: {count}
-📢  Канал: {CHANNEL}
-🤖  Статус: Активен ✅
-
-━━━━━━━━━━━━━━━━━━━"""
-    
-    await message.answer(stats_text, parse_mode='Markdown')
+    count = sum(1 for p in scheduled_posts.values() if p['user_id'] == message.from_user.id)
+    await message.answer(
+        f"📊 СТАТУС\n\n"
+        f"⏰ В очереди: {count}\n"
+        f"📢 Канал: {CHANNEL}\n"
+        f"✅ Активен"
+    )
 
 @router.message(Command("cancel"))
-async def cancel_action(message: Message, state: FSMContext):
-    if not check_access(message.from_user.id):
+async def cancel(message: Message, state: FSMContext):
+    if message.from_user.id not in ALLOWED_USERS:
         return
-    
     await state.clear()
-    await message.answer("❌  Действие отменено", reply_markup=get_main_keyboard())
+    await message.answer("❌ Отменено", reply_markup=get_main_kb())
 
 @router.message(PostStates.waiting_content)
 async def process_content(message: Message, state: FSMContext):
-    if not check_access(message.from_user.id):
+    if message.from_user.id not in ALLOWED_USERS:
         return
     
-    user_id = message.from_user.id
-    
-    photo_id = None
-    text_content = ""
+    media_id = media_type = None
+    text = ""
     
     if message.photo:
-        photo_id = message.photo[-1].file_id
-        text_content = message.caption or ""
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
-        photo_id = message.document.file_id
-        text_content = message.caption or ""
+        media_id = message.photo[-1].file_id
+        media_type = 'photo'
+        text = message.caption or ""
+    elif message.video:
+        media_id = message.video.file_id
+        media_type = 'video'
+        text = message.caption or ""
+    elif message.document and message.document.mime_type:
+        if message.document.mime_type.startswith('image/'):
+            media_id = message.document.file_id
+            media_type = 'photo'
+        elif message.document.mime_type.startswith('video/'):
+            media_id = message.document.file_id
+            media_type = 'video'
+        text = message.caption or ""
     else:
-        text_content = message.text or ""
+        text = message.text or ""
     
-    if not text_content.strip():
-        await message.answer("⚠️  Пожалуйста, отправьте текст поста")
+    if not text.strip():
+        await message.answer("⚠️ Отправь текст")
         return
     
-    parsed = parse_content(text_content)
+    parsed = parse_content(text)
     
     if not parsed['game']:
-        await message.answer("⚠️  Не удалось определить название игры\nПервая строка должна быть названием")
+        await message.answer("⚠️ Укажи название игры в первой строке")
         return
     
-    user_data[user_id] = {
+    user_data[message.from_user.id] = {
         'game': parsed['game'],
         'desc': parsed['desc'],
         'key': parsed['key'],
         'code': parsed['code'],
-        'photo': photo_id
+        'media': media_id,
+        'media_type': media_type
     }
     
     await state.clear()
-    
-    await show_preview(message, user_id)
+    await show_preview(message, message.from_user.id)
 
 @router.message(PostStates.waiting_time)
-async def process_schedule_time(message: Message, state: FSMContext):
-    if not check_access(message.from_user.id):
+async def process_time(message: Message, state: FSMContext):
+    if message.from_user.id not in ALLOWED_USERS:
         return
     
     stime = parse_time(message.text)
     if not stime:
         await message.answer(
-            "⚠️  Неверный формат времени\n\n"
+            "⚠️ Неверный формат\n\n"
             "Примеры:\n"
-            "• 14:30 - сегодня в 14:30\n"
-            "• 2ч - через 2 часа\n"
-            "• 30м - через 30 минут\n"
-            "• 1ч30м - через 1.5 часа\n"
-            "• завтра 10:00 - завтра в 10:00",
-            parse_mode='Markdown'
+            "50м | 2ч30м | 14:30\n"
+            "02.11 15:00 | 02.11.2025 11:40\n"
+            "завтра в 10:00 | через 2 часа"
         )
         return
     
-    user_id = message.from_user.id
-    pid = f"{user_id}_{int(datetime.now().timestamp())}"
-    d = user_data[user_id]
+    uid = message.from_user.id
+    pid = f"{uid}_{int(datetime.now().timestamp())}"
+    d = user_data[uid]
     
     scheduled_posts[pid] = {
-        'user_id': user_id,
+        'user_id': uid,
         'text': format_post(d['game'], d['desc'], d['key'], d['code']),
-        'photo': d.get('photo'),
+        'media': d.get('media'),
+        'media_type': d.get('media_type'),
         'time': stime,
-        'game': d['game']
+        'game': d['game'],
+        'id': pid
     }
     
-    asyncio.create_task(schedule_bg_task(message.bot, pid))
+    asyncio.create_task(schedule_task(message.bot, pid))
     
     await message.answer(
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅  ПОСТ ЗАПЛАНИРОВАН\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎮  {d['game']}\n"
-        f"⏰  {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Посмотреть очередь: 📋 Мои посты",
-        parse_mode='Markdown',
-        reply_markup=get_main_keyboard()
+        f"✅ ЗАПЛАНИРОВАНО\n\n"
+        f"🎮 {d['game']}\n"
+        f"⏰ {stime.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"📋 Очередь — смотри список",
+        reply_markup=get_main_kb()
     )
     
     await state.clear()
-    user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
+    user_data[uid] = {'game': '', 'desc': '', 'key': False, 'code': [], 'media': None, 'media_type': None}
 
 @router.callback_query(F.data == 'publish')
-async def callback_publish(callback: CallbackQuery, state: FSMContext):
-    if not check_access(callback.from_user.id):
+async def cb_publish(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
@@ -432,242 +346,173 @@ async def callback_publish(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.callback_query(F.data == 'schedule')
-async def callback_schedule(callback: CallbackQuery, state: FSMContext):
-    if not check_access(callback.from_user.id):
+async def cb_schedule(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
     await state.set_state(PostStates.waiting_time)
     await callback.message.answer(
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "⏰  КОГДА ОПУБЛИКОВАТЬ?\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏰ КОГДА ОПУБЛИКОВАТЬ?\n\n"
         "Примеры:\n"
-        "• 14:30 - сегодня в 14:30\n"
-        "• 2ч - через 2 часа\n"
-        "• 30м - через 30 минут\n"
-        "• 1ч30м - через 1 час 30 мин\n"
-        "• завтра 10:00 - завтра в 10:00",
-        parse_mode='Markdown'
+        "50м — через 50 минут\n"
+        "2ч — через 2 часа\n"
+        "14:30 — сегодня в 14:30\n"
+        "02.11.2025 11:40 — точная дата\n"
+        "завтра в 10:00 — завтра"
     )
     await callback.answer()
 
 @router.callback_query(F.data == 'edit')
-async def callback_edit(callback: CallbackQuery, state: FSMContext):
-    if not check_access(callback.from_user.id):
+async def cb_edit(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
     await state.set_state(PostStates.waiting_content)
-    await callback.message.answer(
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "✏️  РЕДАКТИРОВАНИЕ\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
-        "Отправь новый контент в том же формате\n"
-        "Все данные будут обновлены",
-        parse_mode='Markdown'
-    )
+    await callback.message.answer("✏️ Отправь новый контент")
     await callback.answer()
 
 @router.callback_query(F.data == 'cancel')
-async def callback_cancel(callback: CallbackQuery, state: FSMContext):
-    if not check_access(callback.from_user.id):
+async def cb_cancel(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ALLOWED_USERS:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
-    user_id = callback.from_user.id
-    user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
-    
+    user_data[callback.from_user.id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'media': None, 'media_type': None}
     await state.clear()
-    await callback.message.answer("❌  Пост отменён", reply_markup=get_main_keyboard())
+    await callback.message.answer("❌ Отменено", reply_markup=get_main_kb())
     await callback.answer()
 
 @router.callback_query(F.data.startswith('del_'))
-async def callback_delete_scheduled(callback: CallbackQuery):
-    if not check_access(callback.from_user.id):
+async def cb_delete(callback: CallbackQuery):
+    if callback.from_user.id not in ALLOWED_USERS:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
     pid = callback.data.replace('del_', '')
     if pid in scheduled_posts:
-        game_name = scheduled_posts[pid].get('game', 'Пост')
+        game = scheduled_posts[pid].get('game', 'Пост')
         del scheduled_posts[pid]
-        await callback.answer(f"✅ {game_name} удалён", show_alert=True)
-        await show_scheduled(callback.message, callback.from_user.id)
+        await callback.answer(f"✅ {game} удалён", show_alert=True)
+        await show_queue(callback.message, callback.from_user.id)
     await callback.answer()
 
-async def show_preview(message: Message, user_id: int):
-    d = user_data[user_id]
-    text = format_post(d['game'], d['desc'], d['key'], d['code'])
+@router.callback_query(F.data.startswith('pub_now_'))
+async def cb_pub_now(callback: CallbackQuery):
+    if callback.from_user.id not in ALLOWED_USERS:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
     
-    preview_header = "━━━━━━━━━━━━━━━━━━━\n👀  ПРЕДПРОСМОТР\n━━━━━━━━━━━━━━━━━━━\n\n"
+    pid = callback.data.replace('pub_now_', '')
+    if pid in scheduled_posts:
+        post = scheduled_posts[pid]
+        try:
+            await send_to_channel(callback.bot, post)
+            await callback.bot.send_message(
+                post['user_id'],
+                f"✅ ОПУБЛИКОВАНО\n\n🎮 {post['game']}\n📢 {CHANNEL}"
+            )
+            del scheduled_posts[pid]
+            await callback.answer("✅ Опубликовано", show_alert=True)
+            await show_queue(callback.message, callback.from_user.id)
+        except Exception as e:
+            await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+    else:
+        await callback.answer("❌ Пост не найден", show_alert=True)
+
+async def show_preview(message: Message, uid: int):
+    d = user_data[uid]
+    text = format_post(d['game'], d['desc'], d['key'], d['code'])
+    preview = f"👀 ПРЕДПРОСМОТР\n\n{text}"
     
     try:
-        if d.get('photo'):
-            await message.answer_photo(
-                photo=d['photo'], 
-                caption=preview_header + text, 
-                parse_mode='Markdown', 
-                reply_markup=get_action_keyboard()
-            )
+        if d.get('media_type') == 'photo':
+            await message.answer_photo(d['media'], caption=preview, parse_mode='Markdown', reply_markup=get_action_kb())
+        elif d.get('media_type') == 'video':
+            await message.answer_video(d['media'], caption=preview, parse_mode='Markdown', reply_markup=get_action_kb())
         else:
-            await message.answer(
-                preview_header + text, 
-                parse_mode='Markdown', 
-                reply_markup=get_action_keyboard()
-            )
+            await message.answer(preview, parse_mode='Markdown', reply_markup=get_action_kb())
     except Exception as e:
-        logger.error(f"Ошибка предпросмотра: {e}")
-        await message.answer(
-            "⚠️  Ошибка отображения\n\n"
-            "Возможные причины:\n"
-            "• Текст слишком длинный\n"
-            "• Неверный формат Markdown\n"
-            "• Проблема с фото\n\n"
-            "Попробуйте заново создать пост"
-        )
+        logger.error(f"Ошибка превью: {e}")
+        await message.answer("⚠️ Ошибка отображения. Попробуй заново")
 
-async def publish_now(message: Message, user_id: int, bot: Bot):
-    d = user_data[user_id]
+async def publish_now(message: Message, uid: int, bot: Bot):
+    d = user_data[uid]
     text = format_post(d['game'], d['desc'], d['key'], d['code'])
-    markup = get_channel_button()
     
     try:
-        if d.get('photo'):
-            await bot.send_photo(
-                chat_id=CHANNEL, 
-                photo=d['photo'], 
-                caption=text, 
-                parse_mode='Markdown', 
-                reply_markup=markup
-            )
+        if d.get('media_type') == 'photo':
+            await bot.send_photo(CHANNEL, d['media'], caption=text, parse_mode='Markdown', reply_markup=get_channel_btn())
+        elif d.get('media_type') == 'video':
+            await bot.send_video(CHANNEL, d['media'], caption=text, parse_mode='Markdown', reply_markup=get_channel_btn())
         else:
-            await bot.send_message(
-                chat_id=CHANNEL, 
-                text=text, 
-                parse_mode='Markdown', 
-                reply_markup=markup
-            )
+            await bot.send_message(CHANNEL, text, parse_mode='Markdown', reply_markup=get_channel_btn())
         
         await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"✅  УСПЕШНО ОПУБЛИКОВАНО\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎮  {d['game']}\n"
-            f"📢  {CHANNEL}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━",
-            parse_mode='Markdown',
-            reply_markup=get_main_keyboard()
+            f"✅ ОПУБЛИКОВАНО\n\n🎮 {d['game']}\n📢 {CHANNEL}",
+            reply_markup=get_main_kb()
         )
-        
-        user_data[user_id] = {'game': '', 'desc': '', 'key': False, 'code': [], 'photo': None}
+        user_data[uid] = {'game': '', 'desc': '', 'key': False, 'code': [], 'media': None, 'media_type': None}
     except Exception as e:
-        logger.error(f"Ошибка публикации: {e}")
-        await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"❌  ОШИБКА ПУБЛИКАЦИИ\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{str(e)[:200]}\n\n"
-            f"Проверьте:\n"
-            f"• Бот админ в {CHANNEL}\n"
-            f"• Есть права на публикацию\n"
-            f"• Канал существует",
-            parse_mode='Markdown'
-        )
+        logger.error(f"Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
-async def schedule_bg_task(bot: Bot, pid: str):
+async def send_to_channel(bot: Bot, post: Dict):
+    markup = get_channel_btn()
+    if post.get('media_type') == 'photo':
+        await bot.send_photo(CHANNEL, post['media'], caption=post['text'], parse_mode='Markdown', reply_markup=markup)
+    elif post.get('media_type') == 'video':
+        await bot.send_video(CHANNEL, post['media'], caption=post['text'], parse_mode='Markdown', reply_markup=markup)
+    else:
+        await bot.send_message(CHANNEL, post['text'], parse_mode='Markdown', reply_markup=markup)
+
+async def schedule_task(bot: Bot, pid: str):
     while pid in scheduled_posts:
         post = scheduled_posts[pid]
         if datetime.now() >= post['time']:
             try:
-                markup = get_channel_button()
-                if post.get('photo'):
-                    await bot.send_photo(
-                        chat_id=CHANNEL, 
-                        photo=post['photo'], 
-                        caption=post['text'], 
-                        parse_mode='Markdown', 
-                        reply_markup=markup
-                    )
-                else:
-                    await bot.send_message(
-                        chat_id=CHANNEL, 
-                        text=post['text'], 
-                        parse_mode='Markdown', 
-                        reply_markup=markup
-                    )
-                
-                await bot.send_message(
-                    chat_id=post['user_id'], 
-                    text=f"━━━━━━━━━━━━━━━━━━━\n✅  ПОСТ ОПУБЛИКОВАН\n━━━━━━━━━━━━━━━━━━━\n\n🎮  {post['game']}\n📢  {CHANNEL}", 
-                    parse_mode='Markdown'
-                )
+                await send_to_channel(bot, post)
+                await bot.send_message(post['user_id'], f"✅ ОПУБЛИКОВАНО\n\n🎮 {post['game']}\n📢 {CHANNEL}")
             except Exception as e:
-                logger.error(f"Ошибка отложенной публикации: {e}")
-                await bot.send_message(
-                    chat_id=post['user_id'], 
-                    text=f"❌  Ошибка публикации:\n{str(e)[:200]}",
-                    parse_mode='Markdown'
-                )
+                logger.error(f"Ошибка: {e}")
+                await bot.send_message(post['user_id'], f"❌ Ошибка: {str(e)[:100]}")
             
             if pid in scheduled_posts:
                 del scheduled_posts[pid]
             break
         await asyncio.sleep(30)
 
-async def show_scheduled(message: Message, user_id: int):
-    posts = {k: v for k, v in scheduled_posts.items() if v['user_id'] == user_id}
+async def show_queue(message: Message, uid: int):
+    posts = {k: v for k, v in scheduled_posts.items() if v['user_id'] == uid}
     
     if not posts:
-        await message.answer(
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "📭  НЕТ ЗАПЛАНИРОВАННЫХ ПОСТОВ\n"
-            "━━━━━━━━━━━━━━━━━━━\n\n"
-            "Создайте новый пост и отложите его",
-            parse_mode='Markdown'
-        )
+        await message.answer("📭 Очередь пуста")
         return
-
-    text = "━━━━━━━━━━━━━━━━━━━\n📅  ЗАПЛАНИРОВАННЫЕ ПОСТЫ\n━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    text = "📅 ЗАПЛАНИРОВАНО\n\n"
     kb = []
     
     for pid, p in sorted(posts.items(), key=lambda x: x[1]['time']):
-        time_left = p['time'] - datetime.now()
-        hours_left = int(time_left.total_seconds() / 3600)
-        minutes_left = int((time_left.total_seconds() % 3600) / 60)
-        
+        delta = p['time'] - datetime.now()
+        h, m = int(delta.total_seconds() // 3600), int((delta.total_seconds() % 3600) // 60)
         time_str = p['time'].strftime('%d.%m в %H:%M')
-        game_title = p.get('game', 'Без названия')
+        countdown = f"через {h}ч {m}м" if h > 0 else f"через {m}м"
         
-        if hours_left > 0:
-            countdown = f"через {hours_left}ч {minutes_left}м"
-        else:
-            countdown = f"через {minutes_left}м"
-        
-        text += f"🎮  {game_title}\n⏰  {time_str} ({countdown})\n\n"
-        kb.append([InlineKeyboardButton(
-            text=f"❌ {game_title}", 
-            callback_data=f'del_{pid}'
-        )])
+        text += f"🎮 {p['game']}\n⏰ {time_str} ({countdown})\n\n"
+        kb.append([
+            InlineKeyboardButton(text=f"🚀 {p['game']}", callback_data=f'pub_now_{pid}'),
+            InlineKeyboardButton(text="❌", callback_data=f'del_{pid}')
+        ])
     
-    text += "━━━━━━━━━━━━━━━━━━━"
-    
-    await message.answer(
-        text, 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), 
-        parse_mode='Markdown'
-    )
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 async def main():
-    logger.info("🚀 Запуск бота...")
-    
+    logger.info("🚀 Старт")
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    
     dp.include_router(router)
-    
-    logger.info(f"✅ Бот запущен! Канал: {CHANNEL}")
-    
+    logger.info(f"✅ Работаю | {CHANNEL}")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=['message', 'callback_query'])
 
@@ -675,6 +520,6 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("⛔ Бот остановлен")
+        logger.info("⛔ Стоп")
     except Exception as e:
-        logger.error(f"💥 CRITICAL ERROR: {e}")
+        logger.error(f"💥 ERROR: {e}")
