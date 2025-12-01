@@ -19,20 +19,21 @@ from aiogram.enums import ParseMode
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8254879975:AAF-ikyNFF3kUeZWBT0pwbq-YnqWRxNIv20"
 CHANNEL_ID = "@RavionScripts"
-WATERMARK = "https://t.me/RavionScripts"
-# ID всех админов через запятую
+WATERMARK_LINK = "https://t.me/RavionScripts"
+# ID всех админов
 ADMINS = {7637946765, 6510703948} 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- ХРАНИЛИЩЕ (В ПАМЯТИ) ---
+# --- ХРАНИЛИЩЕ ---
 scheduled_posts: Dict[str, Dict[str, Any]] = {}
 instruction_messages: Dict[int, int] = {}
 
 class Form(StatesGroup):
-    waiting_content = State()
-    waiting_time = State()
+    waiting_content = State() # Обычный пост
+    waiting_steal = State()   # Режим кражи
+    waiting_time = State()    # Выбор времени
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -42,34 +43,69 @@ def is_admin(user_id: int) -> bool:
 def html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def parse_content(raw_text: str) -> Dict[str, Any]:
+def clean_stolen_text(text: str) -> str:
+    """Удаляет рекламу, ссылки на чужие каналы и мусор."""
+    # Удаляем ссылки t.me/...
+    text = re.sub(r't\.me\/[a-zA-Z0-9_]+', '', text)
+    text = re.sub(r'@\w+', '', text) # Удаляем упоминания @channel
+    # Удаляем строки с призывами подписаться
+    lines = text.split('\n')
+    clean_lines = []
+    for line in lines:
+        low = line.lower()
+        if any(x in low for x in ['подпишись', 'subscribe', 'join', 'канал', 'channel', 'credits']):
+            continue
+        clean_lines.append(line)
+    return "\n".join(clean_lines).strip()
+
+def parse_content(raw_text: str, is_stolen: bool = False) -> Dict[str, Any]:
+    # Если это кража, сначала чистим текст от мусора
+    if is_stolen:
+        # Пытаемся сохранить код нетронутым, чистим только описание
+        parts = raw_text.split('```')
+        desc_part = clean_stolen_text(parts[0])
+        # Собираем обратно, но грубо. Лучше разберем построчно.
+    
     lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
     res = {'game': '🎮 Game', 'desc': '', 'key': False, 'code': []}
     
     if not lines: return res
-    res['game'] = lines[0]
+    
+    # Эвристика: Первая строка - это часто название игры
+    # Если строка короткая (< 40 символов) и не код - берем как заголовок
+    first_line = lines[0]
+    if len(first_line) < 40 and "```" not in first_line and "loadstring" not in first_line.lower():
+        res['game'] = clean_stolen_text(first_line) if is_stolen else first_line
+        lines = lines[1:]
     
     code_found = False
     desc_lines = []
     
-    for line in lines[1:]:
+    for line in lines:
         low = line.lower()
+        # Поиск флагов ключа
         if '#key' in low or 'key+' in low: res['key'] = True; continue
         if '#nokey' in low or 'key-' in low or 'no key' in low: res['key'] = False; continue
-            
-        is_code = any(x in low for x in ['loadstring', 'game:', 'function', 'local ', 'getgenv', '```'])
         
-        if not code_found and is_code:
+        # Определение кода
+        is_code_start = any(x in low for x in ['loadstring', 'game:', 'function', 'local ', 'getgenv', '```'])
+        
+        if not code_found and is_code_start:
             code_found = True
             clean = line.replace('```lua', '').replace('```', '')
-            if 'game:HttpGet' in clean and WATERMARK not in clean:
-                if clean.endswith('()'): clean = clean[:-2] + f'("{WATERMARK}")'
-                elif clean.endswith('();'): clean = clean[:-3] + f'("{WATERMARK}");'
+            # Заменяем чужой loadstring на наш watermark, если это просто ссылка
+            if 'game:HttpGet' in clean and WATERMARK_LINK not in clean:
+                # Если крадем пост, стараемся вставить наш копирайт в скрипт
+                if is_stolen:
+                     pass # Тут можно добавить сложную логику замены ссылок
             res['code'].append(clean)
         elif code_found:
+            # Если начался код, все последующее считаем кодом, пока не встретим закрытие (упрощенно)
             res['code'].append(line.replace('```', ''))
         else:
-            if not line.startswith('#'): desc_lines.append(line)
+            if not line.startswith('#'): 
+                clean_line = clean_stolen_text(line) if is_stolen else line
+                if clean_line: desc_lines.append(clean_line)
     
     res['desc'] = '\n'.join(desc_lines)
     return res
@@ -77,12 +113,25 @@ def parse_content(raw_text: str) -> Dict[str, Any]:
 def build_post_text(data: Dict) -> str:
     game = html_escape(data['game']).upper()
     desc = html_escape(data['desc'])
+    
+    # Шапка
     text = f"<b>━━━━━━━━━━━━━━━━━━━</b>\n🎮 <b>{game}</b>\n<b>━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    if desc: text += f"💬 {desc}\n\n"
+    
+    # Описание в красивой цитате
+    if desc: 
+        text += f"<blockquote>{desc}</blockquote>\n\n"
+    
+    # Статус ключа
     text += "🔐 <b>Требуется ключ</b>\n\n" if data['key'] else "🔓 <b>Ключ не нужен</b>\n\n"
+    
+    # Код
     if data['code']:
         code = "\n".join(data['code'])
+        # Чистим код от лишних пустых строк в начале/конце
+        code = code.strip()
         text += f"⚡ <b>СКРИПТ:</b>\n<pre><code class=\"language-lua\">{html_escape(code)}</code></pre>\n\n"
+    
+    # Подвал
     text += f"<b>━━━━━━━━━━━━━━━━━━━</b>\n📢 {CHANNEL_ID}"
     return text
 
@@ -110,7 +159,7 @@ def parse_time(s: str) -> Optional[datetime]:
 
 def kb_main():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="➕ Новый пост")],
+        [KeyboardButton(text="➕ Новый пост"), KeyboardButton(text="🥷 Украсть пост")],
         [KeyboardButton(text="👤 Профиль")]
     ], resize_keyboard=True)
 
@@ -141,9 +190,25 @@ async def start(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(
         f"👋 Привет, <b>{msg.from_user.first_name}</b>!\n"
-        "Бот готов к работе. Используй меню снизу.",
+        "Выбери действие:",
         reply_markup=kb_main(), parse_mode=ParseMode.HTML
     )
+
+# --- ОБЩАЯ ФУНКЦИЯ ПРОВЕРКИ МЕНЮ ---
+async def check_menu_click(msg: Message, state: FSMContext) -> bool:
+    if msg.text == "👤 Профиль":
+        await state.clear()
+        await profile(msg)
+        return True
+    if msg.text == "➕ Новый пост":
+        await new_post(msg, state)
+        return True
+    if msg.text == "🥷 Украсть пост":
+        await steal_post_start(msg, state)
+        return True
+    return False
+
+# --- ОБРАБОТЧИКИ СОЗДАНИЯ ПОСТА ---
 
 @router.message(F.text == "➕ Новый пост")
 async def new_post(msg: Message, state: FSMContext):
@@ -156,26 +221,43 @@ async def new_post(msg: Message, state: FSMContext):
         "#key\n"
         "loadstring(game:HttpGet('...'))()"
     )
+    info = await msg.answer(
+        "📝 <b>Создание поста</b>\nПришли фото/видео + текст.\nПример:\n"
+        f"<code>{example}</code>", parse_mode=ParseMode.HTML
+    )
+    instruction_messages[msg.chat.id] = info.message_id
+    await state.set_state(Form.waiting_content)
+
+@router.message(F.text == "🥷 Украсть пост")
+async def steal_post_start(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id): return
+    await state.clear()
     
-    info_msg = await msg.answer(
-        "📝 <b>Создание нового поста</b>\n\n"
-        "Отправь фото/видео с описанием или просто текст.\n"
-        "Вот пример формата (нажми чтобы скопировать):\n\n"
-        f"<code>{example}</code>",
+    info = await msg.answer(
+        "🥷 <b>Режим кражи контента</b>\n\n"
+        "Перешли сюда пост из другого канала или скопируй текст.\n"
+        "Я автоматически:\n"
+        "1. Удалю чужие ссылки\n"
+        "2. Найду скрипт\n"
+        "3. Оформлю под наш стиль\n\n"
+        "⏳ Жду сообщение...",
         parse_mode=ParseMode.HTML
     )
-    instruction_messages[msg.chat.id] = info_msg.message_id
-    await state.set_state(Form.waiting_content)
+    instruction_messages[msg.chat.id] = info.message_id
+    await state.set_state(Form.waiting_steal)
 
 @router.message(Form.waiting_content)
 async def process_content(msg: Message, state: FSMContext):
-    # ПРОВЕРКА: Если нажата кнопка меню
-    if msg.text == "👤 Профиль":
-        await state.clear()
-        return await profile(msg)
-    if msg.text == "➕ Новый пост":
-        return await new_post(msg, state)
+    if await check_menu_click(msg, state): return
+    await process_post_input(msg, state, is_stolen=False)
 
+@router.message(Form.waiting_steal)
+async def process_steal(msg: Message, state: FSMContext):
+    if await check_menu_click(msg, state): return
+    await process_post_input(msg, state, is_stolen=True)
+
+async def process_post_input(msg: Message, state: FSMContext, is_stolen: bool):
+    # Удаляем инструкцию
     if msg.chat.id in instruction_messages:
         try:
             await msg.bot.delete_message(msg.chat.id, instruction_messages[msg.chat.id])
@@ -184,35 +266,45 @@ async def process_content(msg: Message, state: FSMContext):
 
     ctype = 'text'
     fid = None
+    # Берем текст из тела или из подписи (caption)
     text = msg.text or msg.caption or ""
     
+    # Определяем тип медиа
     if msg.photo: ctype, fid = 'photo', msg.photo[-1].file_id
     elif msg.video: ctype, fid = 'video', msg.video.file_id
     elif msg.animation: ctype, fid = 'animation', msg.animation.file_id
     elif msg.document: ctype, fid = 'document', msg.document.file_id
     
     if not text.strip() and ctype == 'text':
-        return await msg.answer("⚠️ Пустое сообщение. Попробуй снова.")
+        return await msg.answer("⚠️ Пустое сообщение. Где контент?")
         
-    parsed = parse_content(text)
+    parsed = parse_content(text, is_stolen=is_stolen)
+    
+    # Если украли и не нашли название, ставим заглушку
+    if is_stolen and parsed['game'] == '🎮 Game':
+        parsed['game'] = "⚙️ СКРИПТ"
+
     await state.update_data(ctype=ctype, fid=fid, parsed=parsed)
     
     preview = build_post_text(parsed)
     try:
         kwargs = {"caption": preview, "parse_mode": ParseMode.HTML, "reply_markup": kb_preview()}
+        
         if ctype == 'photo': await msg.answer_photo(fid, **kwargs)
         elif ctype == 'video': await msg.answer_video(fid, **kwargs)
         elif ctype == 'animation': await msg.answer_animation(fid, **kwargs)
         elif ctype == 'document': await msg.answer_document(fid, **kwargs)
         else: await msg.answer(preview, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb_preview())
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        await msg.answer(f"❌ Ошибка форматирования: {e}")
+
+# --- CALLBACKS ---
 
 @router.callback_query(F.data == "cancel")
 async def cancel_post(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.delete()
-    await cb.answer("❌ Создание поста отменено")
+    await cb.answer("❌ Отменено")
 
 @router.callback_query(F.data == "ignore")
 async def ignore_click(cb: CallbackQuery):
@@ -234,22 +326,11 @@ async def pub_now(cb: CallbackQuery, state: FSMContext):
 async def schedule_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_time)
     await cb.message.delete()
-    await cb.message.answer(
-        "⏰ <b>Когда опубликовать?</b>\n\n"
-        "Примеры:\n"
-        "• <code>30м</code> (через 30 мин)\n"
-        "• <code>1ч</code> (через час)\n"
-        "• <code>18:00</code> (сегодня/завтра)",
-        parse_mode=ParseMode.HTML
-    )
+    await cb.message.answer("⏰ Введи время (пример: `1ч` или `18:00`)", parse_mode=ParseMode.HTML)
 
 @router.message(Form.waiting_time)
 async def schedule_finish(msg: Message, state: FSMContext):
-    if msg.text == "👤 Профиль":
-        await state.clear()
-        return await profile(msg)
-    if msg.text == "➕ Новый пост":
-        return await new_post(msg, state)
+    if await check_menu_click(msg, state): return
 
     t = parse_time(msg.text)
     if not t: return await msg.answer("⚠️ Не понял время.")
@@ -274,6 +355,8 @@ async def schedule_finish(msg: Message, state: FSMContext):
         parse_mode=ParseMode.HTML, reply_markup=kb_main()
     )
 
+# --- ПРОФИЛЬ И ОЧЕРЕДЬ ---
+
 @router.message(F.text == "👤 Профиль")
 async def profile(msg: Message):
     if not is_admin(msg.from_user.id): return
@@ -283,8 +366,8 @@ async def profile(msg: Message):
     total = len(scheduled_posts)
     
     text = (
-        f"👨‍💻 <b>Профиль Администратора</b>\n"
-        f"👤 Имя: {msg.from_user.first_name}\n"
+        f"👨‍💻 <b>Админ: {msg.from_user.first_name}</b>\n"
+        f"🆔 <code>{uid}</code>\n"
         f"📦 Твоих постов: <b>{my_posts}</b>\n"
         f"🌐 Всего в очереди: <b>{total}</b>"
     )
@@ -323,11 +406,12 @@ async def view_queue(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("force_") | F.data.startswith("del_"))
 async def queue_action(cb: CallbackQuery):
-    # ИСПРАВЛЕНИЕ: Добавлен параметр 1 в split, чтобы не ломался ID с подчеркиванием
-    action, pid = cb.data.split("_", 1) 
+    try:
+        action, pid = cb.data.split("_", 1)
+    except ValueError:
+        return await cb.answer("❌ Ошибка данных кнопки", show_alert=True)
     
     post = scheduled_posts.get(pid)
-    
     if not post: 
         await cb.message.delete()
         return await cb.answer("❌ Пост уже не существует", show_alert=True)
@@ -344,10 +428,12 @@ async def queue_action(cb: CallbackQuery):
         await cb.message.delete()
         await cb.answer("🚀 Отправляю в публикацию...")
 
+# --- ПУБЛИКАЦИЯ ---
+
 async def publish_post(bot: Bot, data: Dict):
     text = build_post_text(data['parsed'])
     ctype, fid = data['ctype'], data['fid']
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Скрипт в канале", url=WATERMARK)]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Скрипт в канале", url=WATERMARK_LINK)]])
     
     try:
         if ctype == 'photo': await bot.send_photo(CHANNEL_ID, fid, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -358,10 +444,11 @@ async def publish_post(bot: Bot, data: Dict):
     except Exception as e:
         logger.error(f"Err pub: {e}")
 
+# --- ЗАПУСК ---
+
 async def scheduler(bot: Bot):
     while True:
         now = datetime.now()
-        # Создаем копию ключей, чтобы можно было удалять во время итерации
         for pid in list(scheduled_posts.keys()):
             post = scheduled_posts[pid]
             if now >= post['time']:
